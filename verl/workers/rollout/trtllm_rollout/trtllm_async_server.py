@@ -89,6 +89,10 @@ class TRTLLMHttpServer:
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
             self.config.load_format = "auto"
 
+        self.is_vlm_model = (
+            self.model_config.hf_config is not None and hasattr(self.model_config.hf_config, "vision_config")
+        ) or hasattr(self.model_config, "vision_config")
+
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
