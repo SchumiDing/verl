@@ -225,6 +225,7 @@ class TRTLLMHttpServer:
                 input_dict = {
                     "prompt_token_ids": prompt_ids,
                     "multi_modal_data": {},
+                    "mm_processor_kwargs": {},
                 }
                 if image_data:
                     input_dict["multi_modal_data"]["image"] = image_data
