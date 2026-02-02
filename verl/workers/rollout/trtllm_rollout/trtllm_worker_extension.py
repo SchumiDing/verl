@@ -16,7 +16,6 @@ import inspect
 from typing import Optional
 
 import torch
-
 from tensorrt_llm import serialization
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
@@ -44,11 +43,9 @@ class WorkerExtension:
         try:
             if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
                 for module in self.engine.model_engine.model.modules():
-                    if hasattr(module, "pre_reload_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
+                    if hasattr(module, "pre_reload_weights") and not getattr(module, "_weights_removed", False):
                         module.pre_reload_weights()
-                setattr(self.engine.model_engine.model, "first_pre_reload_weights", True)
+                self.engine.model_engine.model.first_pre_reload_weights = True
 
             if ipc_handles is not None:
                 logger.info("Update weights from IPC handles")
@@ -88,9 +85,7 @@ class WorkerExtension:
 
                     # Verify the result is a list as expected
                     if not isinstance(all_handles, list):
-                        raise ValueError(
-                            f"Deserialized data must be a list, got {type(all_handles).__name__} instead"
-                        )
+                        raise ValueError(f"Deserialized data must be a list, got {type(all_handles).__name__} instead")
                 else:
                     # Data is already in the correct format (backward compatibility)
                     all_handles = serialized_handles
@@ -120,9 +115,7 @@ class WorkerExtension:
                         module, "_weights_removed", False
                     ):
                         module.process_weights_after_loading()
-                    if hasattr(module, "post_load_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
+                    if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
                         module.post_load_weights()
                 moe_load_balancer = getattr(self.engine.model_engine, "moe_load_balancer", None)
                 if isinstance(moe_load_balancer, MoeLoadBalancer):

@@ -1,5 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import asyncio
-import os
 import uuid
 
 import numpy as np
@@ -78,6 +90,7 @@ def get_tokenizer(model_path: str):
 
 def get_processor(model_path: str):
     from transformers import AutoProcessor
+
     return AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
 
@@ -86,7 +99,6 @@ def get_processor(model_path: str):
     reason="CUDA not available",
 )
 class TestUnimodalTRTLLMRollout:
-
     @pytest.fixture(scope="class")
     def ray_context(self):
         if ray.is_initialized():
@@ -153,18 +165,20 @@ class TestUnimodalTRTLLMRollout:
         }
 
         request_id = str(uuid.uuid4())
-        output = ray.get(replica.server_handle.generate.remote(
-            prompt_ids=input_ids,
-            sampling_params=sampling_params,
-            request_id=request_id,
-        ))
+        output = ray.get(
+            replica.server_handle.generate.remote(
+                prompt_ids=input_ids,
+                sampling_params=sampling_params,
+                request_id=request_id,
+            )
+        )
 
         assert output is not None
         assert hasattr(output, "token_ids")
         assert len(output.token_ids) > 0
 
         generated_text = tokenizer.decode(output.token_ids, skip_special_tokens=True)
-        print(f"\n[Unimodal Test]")
+        print("\n[Unimodal Test]")
         print(f"Prompt: {prompt}")
         print(f"Generated ({len(output.token_ids)} tokens): {generated_text[:300]}...")
 
@@ -191,15 +205,17 @@ class TestUnimodalTRTLLMRollout:
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             input_ids = tokenizer.encode(text, return_tensors="pt")[0].tolist()
 
-            output = ray.get(replica.server_handle.generate.remote(
-                prompt_ids=input_ids,
-                sampling_params=sampling_params,
-                request_id=str(uuid.uuid4()),
-            ))
+            output = ray.get(
+                replica.server_handle.generate.remote(
+                    prompt_ids=input_ids,
+                    sampling_params=sampling_params,
+                    request_id=str(uuid.uuid4()),
+                )
+            )
             results.append(output)
 
         assert len(results) == len(prompts)
-        for i, (prompt, result) in enumerate(zip(prompts, results)):
+        for i, (prompt, result) in enumerate(zip(prompts, results, strict=False)):
             assert result is not None
             assert len(result.token_ids) > 0
             generated = tokenizer.decode(result.token_ids, skip_special_tokens=True)
@@ -212,7 +228,6 @@ class TestUnimodalTRTLLMRollout:
     reason="CUDA not available",
 )
 class TestMultimodalTRTLLMRollout:
-
     @pytest.fixture(scope="class")
     def ray_context(self):
         if ray.is_initialized():
@@ -283,8 +298,11 @@ class TestMultimodalTRTLLMRollout:
         print("text: ", text)
         input_ids = processor.tokenizer(text, return_tensors="pt", padding=True)["input_ids"][0].tolist()
 
-        print("input_ids decoded: ", processor.tokenizer.decode(input_ids, skip_special_tokens=False, add_special_tokens=False))
-        
+        print(
+            "input_ids decoded: ",
+            processor.tokenizer.decode(input_ids, skip_special_tokens=False, add_special_tokens=False),
+        )
+
         sampling_params = {
             "temperature": 0.7,
             "top_p": 0.9,
@@ -292,19 +310,21 @@ class TestMultimodalTRTLLMRollout:
             "logprobs": False,
         }
 
-        output = ray.get(replica.server_handle.generate.remote(
-            prompt_ids=input_ids,
-            sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()),
-            image_data=[test_image],
-        ))
+        output = ray.get(
+            replica.server_handle.generate.remote(
+                prompt_ids=input_ids,
+                sampling_params=sampling_params,
+                request_id=str(uuid.uuid4()),
+                image_data=[test_image],
+            )
+        )
 
         assert output is not None
         assert hasattr(output, "token_ids")
         assert len(output.token_ids) > 0
 
         generated_text = tokenizer.decode(output.token_ids, skip_special_tokens=True)
-        print(f"\n[Multimodal Test]")
+        print("\n[Multimodal Test]")
         print(f"Prompt: {prompt}")
         print(f"Image size: {test_image.size}")
         print(f"Generated ({len(output.token_ids)} tokens): {generated_text[:300]}...")
@@ -340,12 +360,14 @@ class TestMultimodalTRTLLMRollout:
             "logprobs": False,
         }
 
-        output = ray.get(replica.server_handle.generate.remote(
-            prompt_ids=input_ids,
-            sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()),
-            image_data=[test_image],
-        ))
+        output = ray.get(
+            replica.server_handle.generate.remote(
+                prompt_ids=input_ids,
+                sampling_params=sampling_params,
+                request_id=str(uuid.uuid4()),
+                image_data=[test_image],
+            )
+        )
 
         assert output is not None
         assert len(output.token_ids) > 0
@@ -367,17 +389,19 @@ class TestMultimodalTRTLLMRollout:
             "logprobs": False,
         }
 
-        output = ray.get(replica.server_handle.generate.remote(
-            prompt_ids=input_ids,
-            sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()),
-        ))
+        output = ray.get(
+            replica.server_handle.generate.remote(
+                prompt_ids=input_ids,
+                sampling_params=sampling_params,
+                request_id=str(uuid.uuid4()),
+            )
+        )
 
         assert output is not None
         assert len(output.token_ids) > 0
 
         generated_text = tokenizer.decode(output.token_ids, skip_special_tokens=True)
-        print(f"\n[Text-only on VLM]")
+        print("\n[Text-only on VLM]")
         print(f"Prompt: {prompt}")
         print(f"Generated: {generated_text}")
 
@@ -387,7 +411,6 @@ class TestMultimodalTRTLLMRollout:
     reason="CUDA not available",
 )
 class TestTRTLLMServerLifecycle:
-
     @pytest.fixture(scope="class")
     def ray_context(self):
         if ray.is_initialized():
@@ -433,11 +456,13 @@ class TestTRTLLMServerLifecycle:
 
         sampling_params = {"temperature": 0.7, "top_p": 0.9, "top_k": 50, "logprobs": False}
 
-        output1 = ray.get(replica.server_handle.generate.remote(
-            prompt_ids=input_ids,
-            sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()),
-        ))
+        output1 = ray.get(
+            replica.server_handle.generate.remote(
+                prompt_ids=input_ids,
+                sampling_params=sampling_params,
+                request_id=str(uuid.uuid4()),
+            )
+        )
         assert output1 is not None
         assert len(output1.token_ids) > 0
         print(f"\n[Before Sleep] Generated {len(output1.token_ids)} tokens")
@@ -448,11 +473,13 @@ class TestTRTLLMServerLifecycle:
         loop.run_until_complete(replica.wake_up())
         print("[Wake Up] Server woken up")
 
-        output2 = ray.get(replica.server_handle.generate.remote(
-            prompt_ids=input_ids,
-            sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()),
-        ))
+        output2 = ray.get(
+            replica.server_handle.generate.remote(
+                prompt_ids=input_ids,
+                sampling_params=sampling_params,
+                request_id=str(uuid.uuid4()),
+            )
+        )
         assert output2 is not None
         assert len(output2.token_ids) > 0
         print(f"[After Wake Up] Generated {len(output2.token_ids)} tokens")
