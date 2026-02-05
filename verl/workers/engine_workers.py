@@ -23,6 +23,10 @@ from omegaconf import DictConfig, open_dict
 from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
+try:
+    from verl.workers.engine.mindspeed.transformer_impl import repatch
+except ImportError:
+    repatch = None
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
@@ -37,12 +41,7 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
-from verl.workers.config import (
-    ActorConfig,
-    HFModelConfig,
-    RolloutConfig,
-    TrainingWorkerConfig,
-)
+from verl.workers.config import ActorConfig, HFModelConfig, RolloutConfig, TrainingWorkerConfig
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.utils.losses import ppo_loss
 
@@ -84,7 +83,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
             )
 
         # we use the one defined in model
+        # TODO: this is not elegant and should refactor later
         self.engine_config.use_remove_padding = self.model_config.use_remove_padding
+        self.engine_config.use_fused_kernels = self.model_config.use_fused_kernels
+
+        if repatch is not None:
+            # NPU MindSpeed patch, will be refactored with MindSpeedEngine.
+            repatch(self.engine_config.get("override_transformer_config", {}))
 
         # TODO: add DistProfilerExtension
         self.profiler_config = self.config.profiler_config
@@ -174,6 +179,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["grad_norm"] = grad_norm
         if lr is not None:
             final_metrics["lr"] = lr
+
+        # TODO: confirm the mtp loss IS same across dp
+        for k, v in final_metrics.items():
+            if k.startswith("mtp_losses"):
+                flatten_v = [sublist[0] for sublist in v]  # sublist should be single element
+                final_metrics[k] = sum(flatten_v) / len(flatten_v)
         # compute mfu
         if global_token_num is not None:
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_token_num, delta_time)
@@ -582,6 +593,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
+        log_gpu_memory_usage("Before resume weights", logger=logger)
+
         # 1. resume weights and update weights
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
