@@ -163,24 +163,6 @@ class TRTLLMHttpServer:
                 }
             )
 
-        multimodal_config = None
-        if self.is_vlm_model:
-            from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-
-            multimodal_config = MultimodalServerConfig(
-                media_io_kwargs={
-                    "image": {
-                        "format": "pil",
-                        "device": "cpu",
-                    },
-                    "video": {
-                        "num_frames": 8,
-                        "fps": 30,
-                        "format": "pil",
-                        "device": "cpu",
-                    },
-                }
-            )
         self.llm = await AsyncLLM(**llm_kwargs)
         trtllm_server = OpenAIServer(
             llm=self.llm,
@@ -188,7 +170,6 @@ class TRTLLMHttpServer:
             tool_parser=None,
             server_role=None,
             metadata_server_cfg=None,
-            multimodal_server_config=multimodal_config,
         )
 
         app = trtllm_server.app
