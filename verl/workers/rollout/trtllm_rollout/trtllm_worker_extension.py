@@ -21,9 +21,9 @@ from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.logger import logger
+import tensorrt_llm.llmapi.rlhf_utils.WorkerExtension as trtllm_worker_extension
 
-
-class WorkerExtension:
+class WorkerExtension(trtllm_worker_extension.WorkerExtension):
     def __init__(self):
         pass
 
@@ -129,10 +129,3 @@ class WorkerExtension:
         except Exception as e:
             logger.error("Encountered an error in update_weights")
             raise e
-
-    def check_weights_updated(self) -> bool:
-        """Check if the weights are updated to 0."""
-        weights_updated = True
-        for name, p in self.engine.model_engine.model.named_parameters():
-            weights_updated = weights_updated and torch.allclose(p, torch.zeros_like(p))
-        return weights_updated
