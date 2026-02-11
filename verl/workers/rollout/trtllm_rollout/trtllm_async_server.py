@@ -163,6 +163,7 @@ class TRTLLMHttpServer:
                 }
             )
 
+        multimodal_config = None
         if self.is_vlm_model:
             from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 
@@ -180,24 +181,15 @@ class TRTLLMHttpServer:
                     },
                 }
             )
-            self.llm = await AsyncLLM(**llm_kwargs)
-            trtllm_server = OpenAIServer(
-                llm=self.llm,
-                model=self.model_config.local_path,
-                tool_parser=None,
-                server_role=None,
-                metadata_server_cfg=None,
-                multimodal_server_config=multimodal_config,
-            )
-        else:
-            self.llm = await AsyncLLM(**llm_kwargs)
-            trtllm_server = OpenAIServer(
-                llm=self.llm,
-                model=self.model_config.local_path,
-                tool_parser=None,
-                server_role=None,
-                metadata_server_cfg=None,
-            )
+        self.llm = await AsyncLLM(**llm_kwargs)
+        trtllm_server = OpenAIServer(
+            llm=self.llm,
+            model=self.model_config.local_path,
+            tool_parser=None,
+            server_role=None,
+            metadata_server_cfg=None,
+            multimodal_server_config=multimodal_config,
+        )
 
         app = trtllm_server.app
         self._server_port, self._server_task = await run_unvicorn(app, None, self._server_address)
