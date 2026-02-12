@@ -184,7 +184,7 @@ class TRTLLMHttpServer:
 
     async def generate(
         self,
-        prompt_ids: list[int],
+        prompt_ids: str,
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
@@ -201,9 +201,11 @@ class TRTLLMHttpServer:
 
         trt_llm_sampling_params = SamplingParams(**sampling_params)
         if self.is_vlm_model:
+            org_prompt = self.llm.tokenizer.decode(prompt_ids)
             if image_data or video_data:
+                
                 input_dict = {
-                    "prompt_token_ids": prompt_ids,
+                    "prompt": org_prompt,
                     "multi_modal_data": {},
                     "mm_processor_kwargs": {},
                 }
@@ -211,6 +213,7 @@ class TRTLLMHttpServer:
                     input_dict["multi_modal_data"]["image"] = image_data
                 if video_data:
                     input_dict["multi_modal_data"]["video"] = video_data
+                
                 outputs = await self.llm.generate_async(
                     inputs=input_dict,
                     sampling_params=trt_llm_sampling_params,
@@ -369,7 +372,7 @@ class TRTLLMReplica(RolloutReplica):
                 node_id=node_id,
                 soft=False,
             ),
-            runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
+            runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1", "TLLM_NUMA_AWARE_WORKER_AFFINITY":"0"}},
             name=name,
         ).remote(
             config=self.config,

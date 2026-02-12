@@ -62,7 +62,7 @@ class WorkerExtension(trtllm_worker_extension):
                     # using restricted unpickler from tensorrt_llm.serialization
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
-                    # Allow basic builtins and all torch modules
+                    # Allow basic builtins and torch tensor reconstruction classes
                     approved_imports = {
                         "builtins": [
                             "list",
@@ -76,11 +76,47 @@ class WorkerExtension(trtllm_worker_extension):
                             "NoneType",
                             "type",
                         ],
+                        "torch": [
+                            "Tensor",
+                            "FloatTensor",
+                            "DoubleTensor",
+                            "HalfTensor",
+                            "BFloat16Tensor",
+                            "IntTensor",
+                            "LongTensor",
+                            "ShortTensor",
+                            "CharTensor",
+                            "ByteTensor",
+                            "BoolTensor",
+                            "Size",
+                            "dtype",
+                            "device",
+                            "float32",
+                            "float16",
+                            "int32",
+                            "int64",
+                            "int16",
+                            "int8",
+                            "uint8",
+                            "bool",
+                        ],
+                        "torch.multiprocessing.reductions": [
+                            "rebuild_cuda_tensor",
+                            "rebuild_tensor",
+                        ],
+                        "torch._utils": [
+                            "_rebuild_tensor_v2",
+                        ],
+                        "torch.storage": [
+                            "_load_from_bytes",
+                            "_TypedStorage",
+                            "UntypedStorage",
+                            "TypedStorage",
+                        ],
                     }
                     all_handles = serialization.loads(
                         decoded_data,
                         approved_imports=approved_imports,
-                        approved_module_patterns=[r"^torch.*"],
                     )
 
                     # Verify the result is a list as expected

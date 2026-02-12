@@ -414,7 +414,7 @@ class ServerAdapter(BaseRollout):
         total_available_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) * 1024 * 1024
 
         try:
-            device_uuid = get_device_uuid(self.gpu_id)
+            device_uuid = get_device_uuid(int(self.gpu_id))
         except Exception as e:
             logger.error(f"Failed to get device UUID in update_weights(): {e}")
             device_uuid = None
