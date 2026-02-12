@@ -210,6 +210,14 @@ class vLLMColocateWorkerExtension:
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
         socket.send(b"")
 
+        use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
+            self.model_runner.vllm_config
+        )
+
+        # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
+        if use_standard_weight_load:
+            patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
         # receive bucket and update weights
         while True:
             metadata = socket.recv_pyobj()
@@ -232,6 +240,14 @@ class vLLMColocateWorkerExtension:
             del weights, tensor
             if metadata["is_last"]:
                 break
+
+        if use_standard_weight_load:
+            # Some post-load transforms are non-idempotent; run once after all buckets.
+            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+            model = self.model_runner.model
+            model_config = self.model_runner.vllm_config.model_config
+            process_weights_after_loading(model, model_config, self.device)
 
         # clean up
         socket.close()

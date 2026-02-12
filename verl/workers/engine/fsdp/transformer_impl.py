@@ -108,6 +108,12 @@ class FSDPEngine(BaseEngine):
         self.mode = None
 
         self.rank = torch.distributed.get_rank()
+
+        # Apply NPU patches for FSDP backend
+        from .utils import apply_npu_fsdp_patches
+
+        apply_npu_fsdp_patches()
+
         # build device mesh for Ulysses Sequence Parallel
 
         self.use_remove_padding = self.model_config.use_remove_padding
@@ -164,6 +170,7 @@ class FSDPEngine(BaseEngine):
             lr_scheduler=self.lr_scheduler,
             processing_class=self.model_config.get_processor(),
             checkpoint_config=self.checkpoint_config,
+            trust_remote_code=self.model_config.trust_remote_code,
         )
 
         self.to(
