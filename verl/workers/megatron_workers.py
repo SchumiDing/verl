@@ -701,6 +701,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 # Only export adapter weights
                 per_tensor_param = self.bridge.export_adapter_weights(self.actor.actor_module)
             else:
+                import sys
+                print(f"[rollout_mode] Calling bridge.export_hf_weights", file=sys.stderr, flush=True)
                 per_tensor_param = self.bridge.export_hf_weights(self.actor.actor_module)
         else:
             per_tensor_param = per_tensor_generator(
@@ -727,7 +729,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # Mark base sync as done after first successful sync
             self.base_sync_done = True
 
+        import sys
+        print(f"[rollout_mode] Calling rollout.update_weights with main weights", file=sys.stderr, flush=True)
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        print(f"[rollout_mode] Finished rollout.update_weights", file=sys.stderr, flush=True)
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)

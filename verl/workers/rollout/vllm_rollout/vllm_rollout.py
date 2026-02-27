@@ -166,36 +166,68 @@ class ServerAdapter(BaseRollout):
         offset = 0
         bucket_meta: dict[str, TensorMetadata] = {}
         dtype = PrecisionType.to_dtype(self.config.dtype)
-        async for name, weight in ensure_async_iterator(weights):
-            # model parameters are in fp32 full precision
-            weight = weight.to(dtype, non_blocking=True)
+        
+        import sys
+        weight_count = 0
+        print(f"[vllm_rollout.update_weights] Starting to consume weights from generator", file=sys.stderr, flush=True)
+        
+        try:
+            async for name, weight in ensure_async_iterator(weights):
+                weight_count += 1
+                if weight_count % 500 == 0:  # 减少日志频率：从100改为500
+                    print(f"[vllm_rollout.update_weights] Processed {weight_count} weights so far",
+                          file=sys.stderr, flush=True)
+                
+                # Log the specific weight that might cause issues
+                if weight_count >= 6890:  # Close to where it gets stuck
+                    print(f"[vllm_rollout.update_weights] Processing weight {weight_count}: {name}, "
+                          f"shape={weight.shape}, nbytes={weight.nbytes}, bucket_remaining={bucket_size - offset}",
+                          file=sys.stderr, flush=True)
+                
+                # model parameters are in fp32 full precision
+                weight = weight.to(dtype, non_blocking=True)
 
-            # fill the tensor bucket
-            if offset + weight.nbytes > bucket_size:
-                get_torch_device().synchronize()
-                s.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                s.recv()
-                bucket_meta = {}
-                offset = 0
+                # fill the tensor bucket
+                if offset + weight.nbytes > bucket_size:
+                    print(f"[vllm_rollout.update_weights] Bucket full, sending at weight {weight_count}: {name}",
+                          file=sys.stderr, flush=True)
+                    get_torch_device().synchronize()
+                    s.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+                    s.recv()
+                    bucket_meta = {}
+                    offset = 0
 
-            # TODO: slice embedding layer weight into chunks
-            assert offset + weight.nbytes <= bucket_size, (
-                f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-                f"Please increase rollout.update_weights_bucket_megabytes({bucket_size_mb} MB)."
-            )
-            bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
-            }
-            buffer[offset : offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
-            offset += weight.nbytes
+                # TODO: slice embedding layer weight into chunks
+                if offset + weight.nbytes > bucket_size:
+                    error_msg = (
+                        f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket. "
+                        f"Weight size: {weight.nbytes} bytes, Bucket size: {bucket_size} bytes. "
+                        f"Please increase rollout.update_weights_bucket_megabytes({bucket_size_mb} MB)."
+                    )
+                    print(f"[vllm_rollout.update_weights] ERROR: {error_msg}", file=sys.stderr, flush=True)
+                    raise AssertionError(error_msg)
+                
+                bucket_meta[name] = {
+                    "name": name,
+                    "shape": weight.shape,
+                    "dtype": weight.dtype,
+                    "offset": offset,
+                }
+                buffer[offset : offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
+                offset += weight.nbytes
+        except Exception as e:
+            print(f"[vllm_rollout.update_weights] EXCEPTION at weight {weight_count}: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
 
         # send the last bucket
         get_torch_device().synchronize()
         s.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
         s.recv()
+        
+        print(f"[vllm_rollout.update_weights] Finished consuming all {weight_count} weights", file=sys.stderr, flush=True)
 
         # clean up
         s.close()

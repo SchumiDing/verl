@@ -214,16 +214,27 @@ class vLLMColocateWorkerExtension:
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
+            processed_weights = []
+            for name, tensor in weights:
+                # 检查是否是 q_proj 权重
+                if 'q_proj.weight' in name:
+                    # 检查形状，如果是 (4096, 2048) 则需要扩展为 (8192, 2048)
+                    if tensor.shape[0] == 4096:  # 标准注意力层，无 gate
+                        # 用零填充扩展
+                        zero_pad = torch.zeros_like(tensor)  # (4096, 2048)
+                        tensor = torch.cat([tensor, zero_pad], dim=0)  # (8192, 2048)
+                        logger.info(f"Extended {name} from (4096, *) to (8192, *) with zero padding")
+                processed_weights.append((name, tensor))
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(self.model_runner.vllm_config):
                 logger.info(f"FP8 model detected (async): {self.model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
-                loaded_params = load_quanted_weights(weights, self.model_runner)
+                loaded_params = load_quanted_weights(processed_weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
-                self.model_runner.model.load_weights(weights)
+                self.model_runner.model.load_weights(processed_weights)
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
