@@ -491,3 +491,57 @@ def apply_monkey_patch(
             print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
 
     patch_forward_with_backends(model, use_fused_kernels=use_fused_kernels, fused_kernels_backend=fused_kernels_backend)
+
+def apply_monkey_patch_with_attention_scores(
+    model: PreTrainedModel,
+    top_percent: float = 0.01,
+    bottom_percent: float = 0.01,
+    enable_score_collection: bool = True,
+    ulysses_sp_size: int = 1,
+    use_remove_padding: bool = True,
+    use_fused_kernels: bool = False,
+    fused_kernels_backend: str = None,
+    use_prefix_grouper: bool = False,
+    use_tiled_mlp: bool = False,
+    tiled_mlp_shards: int = 4,
+):
+    """
+    Apply monkey patch with attention score collection
+    """
+
+    apply_monkey_patch(model, ulysses_sp_size, use_remove_padding, 
+                      use_fused_kernels, fused_kernels_backend,
+                      use_prefix_grouper, use_tiled_mlp, tiled_mlp_shards)
+        
+    # If attention score collection is enabled
+    if enable_score_collection:
+        from verl.models.transformers.attention_score_patch import (
+            create_patched_attention_forward,
+            get_attention_collector
+        )
+        
+        # Get model type and number of layers
+        if hasattr(model.config, 'num_hidden_layers'):
+            num_layers = model.config.num_hidden_layers
+        else:
+            num_layers = model.config.text_config.num_hidden_layers
+        
+        # Patch all attention layers
+        model_module = model
+        if hasattr(model, 'model'):
+            model_module = model.model
+        if hasattr(model_module, 'layers'):
+            for layer in model_module.layers:
+                if hasattr(layer, 'self_attn'):
+                    attn = layer.self_attn
+                    original_forward = attn.forward
+                    attn.forward = create_patched_attention_forward(
+                        original_forward,
+                        top_percent=top_percent,
+                        bottom_percent=bottom_percent,
+                        num_layers=num_layers,
+                        use_score_collection=enable_score_collection,
+                    ).__get__(attn, attn.__class__)
+        
+        print(f"Applied attention score collection patch with "
+              f"top_percent={top_percent}, bottom_percent={bottom_percent}")

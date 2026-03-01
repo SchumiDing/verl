@@ -60,6 +60,7 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.tokenizer = None  # Will be set by FSDPWorker
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -111,7 +112,7 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False, collect_attention_scores: bool = False  
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -146,6 +147,16 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
         response_length = micro_batch["responses"].size(-1)
+        
+        # # Debug: Log response_length and check if it's valid
+        # if torch.distributed.get_rank() == 0 and collect_attention_scores:
+        #     print(f"\n[DEBUG] Response info:")
+        #     print(f"  response_length from micro_batch['responses'].size(-1): {response_length}")
+        #     print(f"  micro_batch['responses'].shape: {micro_batch['responses'].shape}")
+        #     if "response_mask" in micro_batch:
+        #         print(f"  micro_batch['response_mask'].shape: {micro_batch['response_mask'].shape}")
+        #         print(f"  response_mask sum: {micro_batch['response_mask'].sum().item()}")
+        
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -154,18 +165,175 @@ class DataParallelPPOActor(BasePPOActor):
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]
+            response = micro_batch["responses"]
             batch_size, seqlen = input_ids.shape
+            # Save original batch_size and seqlen for pad_input later
+            # These should NOT be modified during the forward pass
+            original_batch_size = batch_size
+            original_seqlen = seqlen
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
+            cu_seqlens_for_collector = None
+            original_attention_mask_for_collector = attention_mask.clone()  # Save original attention_mask
+            
+            # Create token mask BEFORE remove_padding to maintain correct dimensions
+            batch_size_orig, seqlen_orig = input_ids.shape
+            token_mask = torch.zeros(batch_size_orig, seqlen_orig, dtype=torch.long, device=input_ids.device)
+            
+            if collect_attention_scores:
+                # # Debug: check if input_ids contains valid tokens
+                # if torch.distributed.get_rank() == 0:
+                #     first_sample = input_ids[0]
+                #     first_mask = attention_mask[0]
+                #     valid_len_check = int(first_mask.sum().item())
+                #     # Check first 10 and last 10 valid tokens
+                #     print(f"\n[DEBUG] Input IDs check for first sample:")
+                #     print(f"  valid_length: {valid_len_check}")
+                #     # print(f"  reponse: {response[0].tolist()}")
+                #     print(f"  first sample: {first_sample.tolist()}")
+                #     print(f"  First 10 tokens: {first_sample[:10].tolist()}")
+                #     print(f"  Last 10 tokens: {first_sample[valid_len_check-10:valid_len_check].tolist()}")
+                #     print(f"  PAD token ID: {self.tokenizer.pad_token_id if self.tokenizer else 'N/A'}")
+                #     print(f"  EOS token ID: {self.tokenizer.eos_token_id if self.tokenizer else 'N/A'}")
+                
+                # Fill token_mask based on response_mask or response_length
+                if "response_mask" in micro_batch:
+                    # Multi-turn case: response_mask marks ALL assistant tokens
+                    response_mask_full = micro_batch["response_mask"]
+                    response_mask_len = response_mask_full.shape[1]
+                    
+                    # # Debug: check response_mask content
+                    # if torch.distributed.get_rank() == 0:
+                    #     print(f"\n[DEBUG] Response mask check:")
+                    #     print(f"  response_mask shape: {response_mask_full.shape}")
+                    #     print(f"  First sample response_mask sum: {response_mask_full[0].sum().item()}")
+                    #     # Find where response tokens are
+                    #     response_indices = torch.nonzero(response_mask_full[0], as_tuple=False).squeeze(-1)
+                    #     if len(response_indices) > 0:
+                    #         print(f"  Response token positions (first/last 5): {response_indices[:5].tolist()} ... {response_indices[-5:].tolist()}")
+                    #     else:
+                    #         print(f"  WARNING: No response tokens marked in response_mask!")
+                    
+                    if response_mask_len == seqlen_orig:
+                        # Same length: directly copy (excluding last token)
+                        token_mask[:, :-1] = response_mask_full[:, :-1]
+                    elif response_mask_len < seqlen_orig:
+                        # response_mask is shorter: map to actual response positions
+                        # For each sample, find where the response actually starts based on valid_length
+                        # The response_mask is aligned with the actual response content, not the full padded sequence
+                        for b in range(batch_size_orig):
+                            valid_length = int(attention_mask[b].sum().item())
+                            # Add bounds check
+                            if valid_length > seqlen_orig or valid_length < 0:
+                                if torch.distributed.get_rank() == 0:
+                                    print(f"[Warning] Invalid valid_length={valid_length} for seqlen={seqlen_orig}, sample {b}")
+                                valid_length = min(max(valid_length, 0), seqlen_orig)
+                            
+                            # Get the actual response length for this sample from response_mask
+                            actual_response_length = int(response_mask_full[b].sum().item())
+                            
+                            if actual_response_length > 0 and valid_length > 0:
+                                # The response is at the end of the valid sequence
+                                prompt_length = valid_length - actual_response_length
+                                # Add bounds check for prompt_length
+                                if prompt_length < 0:
+                                    if torch.distributed.get_rank() == 0:
+                                        print(f"[Warning] Negative prompt_length={prompt_length} for sample {b}, actual_response_length={actual_response_length}, valid_length={valid_length}")
+                                    continue
+                                
+                                if valid_length > 0:
+                                    # Map response_mask to the actual positions in the full sequence
+                                    # Copy only the valid response tokens (excluding the last token for shift)
+                                    response_end = min(valid_length - 1, seqlen_orig)
+                                    response_start = prompt_length
+                                    mask_tokens_to_copy = min(actual_response_length - 1, response_end - response_start)
+                                    
+                                    if mask_tokens_to_copy > 0 and response_start >= 0 and response_start < seqlen_orig:
+                                        # Find which positions in response_mask are actually 1
+                                        response_mask_indices = torch.nonzero(response_mask_full[b], as_tuple=False).squeeze(-1)
+                                        if len(response_mask_indices) > 0:
+                                            # Take at most mask_tokens_to_copy indices (excluding last)
+                                            indices_to_use = response_mask_indices[:mask_tokens_to_copy]
+                                            # Map these to positions in token_mask
+                                            for idx, mask_idx in enumerate(indices_to_use):
+                                                target_pos = response_start + idx
+                                                if target_pos < seqlen_orig and mask_idx < response_mask_len:
+                                                    token_mask[b, target_pos] = response_mask_full[b, mask_idx]
+                    else:
+                        if torch.distributed.get_rank() == 0:
+                            print(f"[Warning] response_mask_len {response_mask_len} > seqlen {seqlen_orig}, truncating")
+                        # Truncate response_mask to fit
+                        token_mask[:, :-1] = response_mask_full[:, :seqlen_orig-1]
+                else:
+                    # Single-turn case: use response_length to identify assistant tokens
+                    response_length = micro_batch["responses"].size(-1)
+                    for b in range(batch_size_orig):
+                        valid_length = int(attention_mask[b].sum().item())
+                        # Add bounds check
+                        if valid_length > seqlen_orig or valid_length < 0:
+                            if torch.distributed.get_rank() == 0:
+                                print(f"[Warning] Invalid valid_length={valid_length} for seqlen={seqlen_orig}, sample {b}")
+                            valid_length = min(max(valid_length, 0), seqlen_orig)
+                        
+                        prompt_length = valid_length - response_length
+                        # Add bounds check
+                        if prompt_length < 0:
+                            if torch.distributed.get_rank() == 0:
+                                print(f"[Warning] Negative prompt_length={prompt_length} for sample {b}, skipping")
+                            continue
+                        
+                        if valid_length > 1:  # Need at least 2 tokens
+                            end_pos = min(valid_length - 1, seqlen_orig)
+                            if end_pos > prompt_length:
+                                token_mask[b, prompt_length:end_pos] = 1
+            
+            # Log token_mask statistics
+            if torch.distributed.get_rank() == 0 and collect_attention_scores:
+                # print(f"\n[STEP 0] After token_mask creation:")
+                # print(f"  token_mask.shape: {token_mask.shape}")
+                # print(f"  token_mask.sum(): {token_mask.sum().item()}")
+                # print(f"  Samples with response tokens: {(token_mask.sum(dim=1) > 0).sum().item()}/{batch_size_orig}")
+                # print(f"  Original batch_size: {original_batch_size}, original_seqlen: {original_seqlen}")
+                # Show per-sample statistics
+                for b in range(min(3, batch_size_orig)):  # Show first 3 samples
+                    valid_len = int(attention_mask[b].sum().item())
+                    response_tokens = int(token_mask[b].sum().item())
+                    # Calculate prompt_length correctly
+                    actual_prompt_length = valid_len - response_tokens
+                    # print(f"  Sample {b}: valid_length={valid_len}, response_tokens={response_tokens}, prompt_length={actual_prompt_length}")
+            
             if self.use_remove_padding:
+                # Log input shapes before unpad_input
+                # if torch.distributed.get_rank() == 0 and collect_attention_scores:
+                #     print(f"\n[STEP 1] Before unpad_input:")
+                #     print(f"  input_ids.shape: {input_ids.shape}")
+                #     print(f"  attention_mask.shape: {attention_mask.shape}")
+                #     print(f"  attention_mask.sum(): {attention_mask.sum().item()}")
+                #     print(f"  batch_size: {batch_size}, seqlen: {seqlen}")
+                
                 input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
                 )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                
+                # # Log indices information after unpad_input
+                # if torch.distributed.get_rank() == 0 and collect_attention_scores:
+                #     print(f"\n[STEP 2] After unpad_input:")
+                #     print(f"  input_ids_rmpad.shape: {input_ids_rmpad.shape}")
+                #     print(f"  indices.shape: {indices.shape}")
+                #     print(f"  indices.min(): {indices.min().item()}, indices.max(): {indices.max().item()}")
+                #     print(f"  cu_seqlens.shape: {cu_seqlens.shape}")
+                #     print(f"  cu_seqlens: {cu_seqlens.tolist()}")
+                #     print(f"  Expected max index (batch_size * seqlen - 1): {batch_size * seqlen - 1}")
+                #     if indices.max().item() >= batch_size * seqlen:
+                #         print(f"  [WARNING] indices.max() >= batch_size * seqlen!")
+                
+                # Store cu_seqlens for attention score collection
+                cu_seqlens_for_collector = cu_seqlens
 
                 # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
@@ -208,6 +376,18 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # for compute the log_prob
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+                
+                # Add safety check for rolled input_ids
+                if collect_attention_scores and torch.distributed.get_rank() == 0:
+                    # Check if any labels are out of bounds
+                    vocab_size = getattr(self.actor_module.config, 'vocab_size', 151936)  # Qwen2 default
+                    max_label = input_ids_rmpad_rolled.max().item()
+                    min_label = input_ids_rmpad_rolled.min().item()
+                    if max_label >= vocab_size or min_label < 0:
+                        print(f"[WARNING] Labels out of bounds!")
+                        print(f"  vocab_size: {vocab_size}")
+                        print(f"  min_label: {min_label}, max_label: {max_label}")
+
 
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
@@ -240,7 +420,81 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
-
+                
+                if collect_attention_scores:
+                    from verl.models.transformers.attention_score_patch import get_attention_collector
+                    collector = get_attention_collector()
+                    collector.enable()
+                    collector.reset()
+                    
+                    # Pass the pre-created token_mask, cu_seqlens, and original attention_mask
+                    cu_seqlens_for_mask = cu_seqlens_for_collector if self.use_remove_padding else None
+                    attention_mask_for_collector = original_attention_mask_for_collector if self.use_remove_padding else attention_mask
+                    collector.set_token_mask(token_mask, cu_seqlens=cu_seqlens_for_mask, attention_mask=attention_mask_for_collector)
+                    
+                    # # Log first sample's dialogue on rank 0
+                    # if torch.distributed.get_rank() == 0 and self.tokenizer is not None:
+                    #     try:
+                    #         # Use original input_ids and masks before padding removal
+                    #         first_sample_ids = micro_batch["input_ids"][0]
+                    #         first_sample_mask = original_attention_mask_for_collector[0]
+                    #         first_token_mask = token_mask[0]
+                            
+                    #         # Get valid length
+                    #         valid_length = int(first_sample_mask.sum().item())
+                            
+                    #         # Find the range of valid tokens (non-padding) to handle left/right padding
+                    #         valid_indices = torch.nonzero(first_sample_mask, as_tuple=False).squeeze(-1)
+                    #         if len(valid_indices) == 0:
+                    #             print("[WARNING] No valid tokens found in first sample!")
+                    #             raise ValueError("No valid tokens found")
+                            
+                    #         start_idx = int(valid_indices[0].item())
+                    #         end_idx = int(valid_indices[-1].item()) + 1
+                            
+                    #         # Decode full sequence (only valid tokens)
+                    #         valid_tokens = first_sample_ids[start_idx:end_idx]
+                    #         full_text = self.tokenizer.decode(valid_tokens, skip_special_tokens=False)
+                            
+                    #         # For multi-turn: separate into segments based on token_mask changes
+                    #         prompt_indices = []
+                    #         response_indices = []
+                            
+                    #         in_response = False
+                    #         for idx in range(start_idx, end_idx):
+                    #             is_response = first_token_mask[idx].item() == 1
+                    #             if is_response:
+                    #                 response_indices.append(idx)
+                    #                 in_response = True
+                    #             else:
+                    #                 prompt_indices.append(idx)
+                    #                 if in_response:
+                    #                     # Transition from response to prompt (new turn)
+                    #                     in_response = False
+                            
+                    #         num_response_tokens = len(response_indices)
+                    #         num_prompt_tokens = len(prompt_indices)
+                            
+                    #         print(f"\n{'='*80}")
+                    #         print(f"[Rank 0] First sample dialogue sequence:")
+                    #         print(f"  Total tokens: {valid_length}")
+                    #         print(f"  Valid token range: [{start_idx}, {end_idx})")
+                    #         print(f"  Prompt tokens: {num_prompt_tokens}")
+                    #         print(f"  Response tokens (assistant): {num_response_tokens}")
+                    #         print(f"{'-'*80}")
+                    #         print(f"FULL CONVERSATION:")
+                    #         print(full_text)
+                    #         print(f"{'='*80}\n")
+                    #     except Exception as e:
+                    #         import traceback
+                    #         print(f"[Rank 0] Failed to decode dialogue: {e}")
+                    #         traceback.print_exc()
+                            
+                # if torch.distributed.get_rank() == 0:
+                #     print(f"Before actor module:")
+                #     print(f"input_ids_rmpad: {input_ids_rmpad.shape}")
+                #     print(f"First sample: {self.tokenizer.decode(input_ids_rmpad[0].tolist(), skip_special_tokens=False)}")
+                    
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -249,7 +503,33 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
-
+                attention_scores_dict = None
+                if collect_attention_scores:
+                    collector = get_attention_collector()
+                    if len(collector.top_scores_per_layer) > 0:
+                        top_scores = torch.stack(collector.top_scores_per_layer)  # (num_layers * batch_size,)
+                        bottom_scores = torch.stack(collector.bottom_scores_per_layer)  # (num_layers * batch_size,)
+                        
+                        # Reshape to (num_layers, batch_size) for easier analysis
+                        try:
+                            num_layers = self.actor_module.config.num_hidden_layers
+                        except:
+                            num_layers = self.actor_module.config.text_config.num_hidden_layers
+                        
+                        batch_size = top_scores.shape[0] // num_layers
+                        top_scores = top_scores.reshape(num_layers, batch_size)
+                        bottom_scores = bottom_scores.reshape(num_layers, batch_size)
+                        
+                        # Store scores for logging
+                        attention_scores_dict = {
+                            "top_scores_mean": top_scores.mean().item(),
+                            "bottom_scores_mean": bottom_scores.mean().item(),
+                            "top_scores_std": top_scores.std().item(),
+                            "bottom_scores_std": bottom_scores.std().item(),
+                            "top_scores_per_layer_mean": top_scores.mean(dim=1).detach(),  # (num_layers,)
+                            "bottom_scores_per_layer_mean": bottom_scores.mean(dim=1).detach(),  # (num_layers,)
+                        }
+                        
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
@@ -267,6 +547,15 @@ class DataParallelPPOActor(BasePPOActor):
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
+                    
+                    # Add immediate check after logprobs computation
+                    if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+                        if torch.distributed.get_rank() == 0:
+                            print(f"[ERROR] Invalid log_probs immediately after logprobs_from_logits")
+                            print(f"  NaN: {torch.isnan(log_probs).any()}, Inf: {torch.isinf(log_probs).any()}")
+                            print(f"  log_probs shape: {log_probs.shape}")
+                            print(f"  log_probs stats: min={log_probs.min()}, max={log_probs.max()}")
+
 
                     # compute entropy
                     if calculate_entropy:
@@ -314,40 +603,183 @@ class DataParallelPPOActor(BasePPOActor):
                         entropy_rmpad = entropy_rmpad[:0]
 
                 # pad back to (bsz, seqlen)
+                # Log tensor shapes before pad_input
+                # if torch.distributed.get_rank() == 0 and collect_attention_scores:
+                #     print(f"\n[STEP 3] Before pad_input:")
+                #     print(f"  log_probs.shape: {log_probs.shape}")
+                #     if calculate_entropy:
+                #         print(f"  entropy_rmpad.shape: {entropy_rmpad.shape}")
+                #     if calculate_sum_pi_squared:
+                #         print(f"  sum_pi_squared_rmpad.shape: {sum_pi_squared_rmpad.shape}")
+                #     print(f"  indices.shape: {indices.shape}")
+                #     print(f"  indices.min(): {indices.min().item()}, indices.max(): {indices.max().item()}")
+                #     print(f"  Using original_batch_size: {original_batch_size}, original_seqlen: {original_seqlen}")
+                #     print(f"  original_batch_size * original_seqlen: {original_batch_size * original_seqlen}")
+                #     if indices.max().item() >= original_batch_size * original_seqlen:
+                #         print(f"  [ERROR] indices.max() ({indices.max().item()}) >= original_batch_size * original_seqlen ({original_batch_size * original_seqlen})!")
+                #         print(f"  This will cause index out of bounds in pad_input!")
+                
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
                         indices=indices,
-                        batch=batch_size,
-                        seqlen=seqlen,
+                        batch=original_batch_size,
+                        seqlen=original_seqlen,
                     )
+                    # Fix padding positions for entropy (should be 0, which is actually correct for entropy)
+                    # Entropy of a deterministic distribution is 0, so padding=0 is acceptable
+                    
                 if calculate_sum_pi_squared:
                     full_sum_pi_squared = pad_input(
                         hidden_states=sum_pi_squared_rmpad.unsqueeze(-1),
                         indices=indices,
-                        batch=batch_size,
-                        seqlen=seqlen,
+                        batch=original_batch_size,
+                        seqlen=original_seqlen,
                     )
+                    # Fix padding positions for sum_pi_squared (should be 0, which is correct)
+
                 full_log_probs = pad_input(
                     hidden_states=log_probs.unsqueeze(-1),
                     indices=indices,
-                    batch=batch_size,
-                    seqlen=seqlen,
+                    batch=original_batch_size,
+                    seqlen=original_seqlen,
                 )
+                
+                # # Log tensor shapes after pad_input
+                # if torch.distributed.get_rank() == 0 and collect_attention_scores:
+                #     print(f"\n[STEP 4] After pad_input:")
+                #     print(f"  full_log_probs.shape: {full_log_probs.shape}")
+                #     if calculate_entropy:
+                #         print(f"  full_entropy.shape: {full_entropy.shape}")
+                #     if calculate_sum_pi_squared:
+                #         print(f"  full_sum_pi_squared.shape: {full_sum_pi_squared.shape}")
+                #     print(f"  Expected shape: ({original_batch_size}, {original_seqlen}, 1)")
+                #     print(f"  attention_mask.shape: {attention_mask.shape}")
+                
+                # CRITICAL FIX: pad_input initializes padding positions to 0, but log_probs should be negative
+                # Replace 0 values (padding) with a safe negative value
+                # This prevents issues when these values are used in exp() calculations
+                # Use try-except to catch any CUDA errors from previous operations
+                try:
+                    full_log_probs_2d = full_log_probs.squeeze(-1)
+                    # Create padding mask safely - move to CPU if needed to avoid CUDA errors
+                    padding_mask = (full_log_probs_2d == 0) & (attention_mask == 0)  # True for padding positions
+                    
+                    # Check if there are any padding positions to fix
+                    has_padding = padding_mask.any().item()  # Force sync here
+                    
+                    if has_padding:
+                        full_log_probs_2d = full_log_probs_2d.masked_fill(padding_mask, 0.0)
+                        full_log_probs = full_log_probs_2d.unsqueeze(-1)
+                        # if torch.distributed.get_rank() == 0 and collect_attention_scores:
+                        #     num_fixed = padding_mask.sum().item()
+                        #     print(f"  [Debug] Fixed {num_fixed} padding positions in log_probs (set to 0.0)")
+                except RuntimeError as e:
+                    if "CUDA" in str(e) or "device-side assert" in str(e):
+                        if torch.distributed.get_rank() == 0:
+                            print(f"[ERROR] CUDA error detected during log_probs padding fix: {e}")
+                            print(f"  This indicates an earlier CUDA assertion was triggered")
+                            print(f"  full_log_probs shape: {full_log_probs.shape}")
+                            print(f"  attention_mask shape: {attention_mask.shape}")
+                        # Re-raise to propagate the error
+                        raise
+
+
 
                 # only return response part:
+                # Note: In multi-turn scenarios with response_mask, we should use the mask
+                # to extract responses instead of assuming they're at the end
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 if calculate_sum_pi_squared:
                     # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                
+                # # Add debug info for log_probs extraction
+                # if collect_attention_scores and torch.distributed.get_rank() == 0:
+                #     print(f"[Debug] After padding back:")
+                #     print(f"  full_log_probs shape: {full_log_probs.shape}")
+                #     print(f"  response_length: {response_length}")
+                #     print(f"  extracted log_probs shape: {log_probs.shape}")
+                #     print(f"  log_probs min/max/mean: {log_probs.min():.4f}/{log_probs.max():.4f}/{log_probs.mean():.4f}")
+                #     # Check for zeros in log_probs (which shouldn't be there)
+                #     num_zeros = (log_probs == 0).sum().item()
+                #     if num_zeros > 0:
+                #         print(f"  [WARNING] Found {num_zeros} zero values in log_probs!")
+
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                
+                if collect_attention_scores:
+                    from verl.models.transformers.attention_score_patch import get_attention_collector
+                    collector = get_attention_collector()
+                    collector.enable()
+                    collector.reset()
+                    
+                    # Pass the pre-created token_mask (no cu_seqlens in non-rmpad mode)
+                    collector.set_token_mask(token_mask, cu_seqlens=None, attention_mask=attention_mask)
+                    
+                    # Log first sample's dialogue on rank 0
+                    # if torch.distributed.get_rank() == 0 and self.tokenizer is not None:
+                    #     try:
+                    #         first_sample_ids = input_ids[0]
+                    #         first_sample_mask = attention_mask[0]
+                    #         first_token_mask = token_mask[0]
+                            
+                    #         # Get valid length
+                    #         valid_length = int(first_sample_mask.sum().item())
+                            
+                    #         # Find the range of valid tokens (non-padding) to handle left/right padding
+                    #         valid_indices = torch.nonzero(first_sample_mask, as_tuple=False).squeeze(-1)
+                    #         if len(valid_indices) == 0:
+                    #             print("[WARNING] No valid tokens found in first sample!")
+                    #             raise ValueError("No valid tokens found")
+                            
+                    #         start_idx = int(valid_indices[0].item())
+                    #         end_idx = int(valid_indices[-1].item()) + 1
+                            
+                    #         # Decode full sequence (only valid tokens)
+                    #         valid_tokens = first_sample_ids[start_idx:end_idx]
+                    #         full_text = self.tokenizer.decode(valid_tokens, skip_special_tokens=False)
+                            
+                    #         # For multi-turn: separate into segments based on token_mask changes
+                    #         prompt_indices = []
+                    #         response_indices = []
+                            
+                    #         in_response = False
+                    #         for idx in range(start_idx, end_idx):
+                    #             is_response = first_token_mask[idx].item() == 1
+                    #             if is_response:
+                    #                 response_indices.append(idx)
+                    #                 in_response = True
+                    #             else:
+                    #                 prompt_indices.append(idx)
+                    #                 if in_response:
+                    #                     # Transition from response to prompt (new turn)
+                    #                     in_response = False
+                            
+                    #         num_response_tokens = len(response_indices)
+                    #         num_prompt_tokens = len(prompt_indices)
+                            
+                    #         print(f"\n{'='*80}")
+                    #         print(f"[Rank 0] First sample dialogue sequence (non-rmpad mode):")
+                    #         print(f"  Total tokens: {valid_length}")
+                    #         print(f"  Valid token range: [{start_idx}, {end_idx})")
+                    #         print(f"  Prompt tokens: {num_prompt_tokens}")
+                    #         print(f"  Response tokens (assistant): {num_response_tokens}")
+                    #         print(f"{'-'*80}")
+                    #         print(f"FULL CONVERSATION:")
+                    #         print(full_text)
+                    #         print(f"{'='*80}\n")
+                    #     except Exception as e:
+                    #         import traceback
+                    #         print(f"[Rank 0] Failed to decode dialogue: {e}")
+                    #         traceback.print_exc()
 
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -357,6 +789,32 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                
+                attention_scores_dict = None
+                if collect_attention_scores:
+                    collector = get_attention_collector()
+                    if len(collector.top_scores_per_layer) > 0:
+                        top_scores = torch.stack(collector.top_scores_per_layer)
+                        bottom_scores = torch.stack(collector.bottom_scores_per_layer)
+                        
+                        # Reshape to (num_layers, batch_size)
+                        try:
+                            num_layers = self.actor_module.config.num_hidden_layers
+                        except:
+                            num_layers = self.actor_module.config.text_config.num_hidden_layers
+                        
+                        batch_size = top_scores.shape[0] // num_layers
+                        top_scores = top_scores.reshape(num_layers, batch_size)
+                        bottom_scores = bottom_scores.reshape(num_layers, batch_size)
+                        
+                        attention_scores_dict = {
+                            "top_scores_mean": top_scores.mean().item(),
+                            "bottom_scores_mean": bottom_scores.mean().item(),
+                            "top_scores_std": top_scores.std().item(),
+                            "bottom_scores_std": bottom_scores.std().item(),
+                            "top_scores_per_layer_mean": top_scores.mean(dim=1).detach(),
+                            "bottom_scores_per_layer_mean": bottom_scores.mean(dim=1).detach(),
+                        }
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -381,11 +839,20 @@ class DataParallelPPOActor(BasePPOActor):
                             else torch.utils.checkpoint.checkpoint(self.calculate_sum_pi_squared_from_logits, logits)
                         )
 
+            # Add safety check before returning
+            if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+                if torch.distributed.get_rank() == 0:
+                    print(f"[ERROR] Invalid log_probs in _forward_micro_batch (rmpad path)")
+                    print(f"  NaN={torch.isnan(log_probs).any()}, Inf={torch.isinf(log_probs).any()}")
+                    print(f"  log_probs stats: min={log_probs.min()}, max={log_probs.max()}, mean={log_probs.mean()}")
+            
             outputs = {"log_probs": log_probs}
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if attention_scores_dict is not None:
+                outputs["attention_scores"] = attention_scores_dict
             return outputs
 
     def _optimizer_step(self):
@@ -578,11 +1045,50 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     # all return: (bsz, response_length)
+                    collect_attention_scores = self.config.get("collect_attention_scores", False)
                     outputs = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                        collect_attention_scores=collect_attention_scores
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+                    
+                    # Add safety check for log_prob
+                    if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
+                        if torch.distributed.get_rank() == 0:
+                            print(f"[ERROR] Invalid log_prob detected: NaN={torch.isnan(log_prob).any()}, Inf={torch.isinf(log_prob).any()}")
+                            print(f"  log_prob stats: min={log_prob.min()}, max={log_prob.max()}, mean={log_prob.mean()}")
+                        # Replace invalid values with a safe value
+                        log_prob = torch.nan_to_num(log_prob, nan=-100.0, posinf=-100.0, neginf=-100.0)
+                    
+                    # # CRITICAL: Check dimension matching between log_prob and response_mask
+                    # if log_prob.shape != response_mask.shape:
+                    #     if torch.distributed.get_rank() == 0:
+                    #         print(f"[ERROR] Shape mismatch!")
+                    #         print(f"  log_prob.shape: {log_prob.shape}")
+                    #         print(f"  response_mask.shape: {response_mask.shape}")
+                    #         print(f"  This will cause incorrect masking in loss computation!")
+                    
+                    # Check if there are zero values in log_prob where response_mask is 1
+                    # if (log_prob == 0).any():
+                    #     zero_in_response = ((log_prob == 0) & (response_mask == 1)).sum().item()
+                    #     if zero_in_response > 0 and torch.distributed.get_rank() == 0:
+                    #         print(f"[ERROR] Found {zero_in_response} zero log_prob values in response positions!")
+                    #         print(f"  This indicates padding positions are not properly excluded!")
+                    #         # Show which positions have this problem
+                    #         for b in range(min(2, log_prob.shape[0])):  # Check first 2 samples
+                    #             bad_positions = torch.where((log_prob[b] == 0) & (response_mask[b] == 1))[0]
+                    #             if len(bad_positions) > 0:
+                    #                 print(f"    Sample {b}: positions {bad_positions.tolist()[:10]}")  # Show first 10
+
+                    
+                    # Record attention scores if available
+                    if "attention_scores" in outputs:
+                        attn_scores = outputs["attention_scores"]
+                        micro_batch_metrics["actor/attn_top_mean"] = attn_scores["top_scores_mean"]
+                        micro_batch_metrics["actor/attn_bottom_mean"] = attn_scores["bottom_scores_mean"]
+                        micro_batch_metrics["actor/attn_top_std"] = attn_scores["top_scores_std"]
+                        micro_batch_metrics["actor/attn_bottom_std"] = attn_scores["bottom_scores_std"]
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:

@@ -422,16 +422,40 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
             )
 
-            apply_monkey_patch(
-                model=actor_module,
-                use_remove_padding=use_remove_padding,
-                ulysses_sp_size=self.ulysses_sequence_parallel_size,
-                use_fused_kernels=use_fused_kernels,
-                fused_kernels_backend=fused_kernels_backend,
-                use_prefix_grouper=use_prefix_grouper,
-                use_tiled_mlp=use_tiled_mlp,
-                tiled_mlp_shards=tiled_mlp_shards,
-            )
+            # Check if attention score collection is enabled
+            collect_attention_scores = self.config.actor.get("collect_attention_scores", False)
+            if collect_attention_scores:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch_with_attention_scores
+                
+                attention_score_top_percent = self.config.actor.get("attention_score_top_percent", 0.01)
+                attention_score_bottom_percent = self.config.actor.get("attention_score_bottom_percent", 0.01)
+                
+                apply_monkey_patch_with_attention_scores(
+                    model=actor_module,
+                    top_percent=attention_score_top_percent,
+                    bottom_percent=attention_score_bottom_percent,
+                    enable_score_collection=True,
+                    use_remove_padding=use_remove_padding,
+                    ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                    use_fused_kernels=use_fused_kernels,
+                    fused_kernels_backend=fused_kernels_backend,
+                    use_prefix_grouper=use_prefix_grouper,
+                    use_tiled_mlp=use_tiled_mlp,
+                    tiled_mlp_shards=tiled_mlp_shards,
+                )
+            else:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch
+                
+                apply_monkey_patch(
+                    model=actor_module,
+                    use_remove_padding=use_remove_padding,
+                    ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                    use_fused_kernels=use_fused_kernels,
+                    fused_kernels_backend=fused_kernels_backend,
+                    use_prefix_grouper=use_prefix_grouper,
+                    use_tiled_mlp=use_tiled_mlp,
+                    tiled_mlp_shards=tiled_mlp_shards,
+                )
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
@@ -821,6 +845,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor = DataParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
+            # Set tokenizer for logging
+            self.actor.tokenizer = self.tokenizer
 
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))

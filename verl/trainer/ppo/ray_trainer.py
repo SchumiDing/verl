@@ -1385,6 +1385,7 @@ class RayPPOTrainer:
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                print(f"Heartbeat: Before generate_sequences, global_steps: {self.global_steps}")
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
@@ -1444,7 +1445,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-
+                    print(f"Heartbeat: After generate_sequences, global_steps: {self.global_steps}")
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1603,13 +1604,15 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        print(f"Heartbeat: Before update_actor, global_steps: {self.global_steps}")
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
-
+                        print(f"Heartbeat: After update_actor, global_steps: {self.global_steps}")
+                        print(f"Heartbeat: Before update_weights, global_steps: {self.global_steps}")
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights()
-
+                        print(f"Heartbeat: After update_weights, global_steps: {self.global_steps}")
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 

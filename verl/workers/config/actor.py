@@ -275,6 +275,9 @@ class FSDPActorConfig(ActorConfig):
         entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
         fsdp_config (dict[str, Any]): Configuration for FSDP settings.
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+        collect_attention_scores (bool): Whether to collect attention scores during training.
+        attention_score_top_percent (float): Percentage of top attention scores to collect (0.0-1.0).
+        attention_score_bottom_percent (float): Percentage of bottom attention scores to collect (0.0-1.0).
     """
 
     strategy: str = "fsdp"
@@ -287,6 +290,9 @@ class FSDPActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
     calculate_sum_pi_squared: bool = False
     sum_pi_squared_checkpointing: bool = False
+    collect_attention_scores: bool = False
+    attention_score_top_percent: float = 0.01
+    attention_score_bottom_percent: float = 0.01
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
