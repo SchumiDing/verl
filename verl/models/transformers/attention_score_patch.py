@@ -91,11 +91,10 @@ def compute_attention_with_scores(
     bsz, num_heads, q_len, _ = query_states.shape
     _, num_kv_heads, kv_len, _ = key_states.shape
     
-    # Repeat KV heads if needed (for GQA/MQA)
+    # OPTIMIZATION 1: Delay KV head repeat for GQA/MQA until needed
+    # This postpones memory allocation and avoids extra memory during mask creation
     num_key_value_groups = num_heads // num_kv_heads
-    if num_key_value_groups > 1:
-        key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
-        value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
+    needs_kv_repeat = num_key_value_groups > 1
     
     # Create proper attention mask for packed sequence mode if needed
     # In packed sequence mode, we need causal mask + sample boundary mask
@@ -123,6 +122,11 @@ def compute_attention_with_scores(
                         causal_mask[0, :, pos, start_idx:pos+1] = 0.0
             
             attention_mask = causal_mask
+    
+    # OPTIMIZATION 1 continued: Now perform GQA/MQA repeat operation right before matmul
+    if needs_kv_repeat:
+        key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
+        value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
     
     # Compute attention scores
     # (bsz, num_heads, q_len, kv_len)
@@ -213,16 +217,18 @@ def compute_attention_with_scores(
         max_k_top = k_top_all.max().item() if num_valid > 0 else 1
         max_k_bottom = k_bottom_all.max().item() if num_valid > 0 else 1
         
+        # OPTIMIZATION 2: Use in-place operations to reduce memory allocation
+        # Instead of clone() + assignment, use masked_fill_ for in-place modification
         # Create masked versions: set masked positions to extreme values
         # For topk: set masked to -inf (will be ignored)
         # For bottomk: set masked to +inf (will be ignored)
         attn_for_topk = valid_attn.clone()
         attn_for_bottomk = valid_attn.clone()
         
-        # Set masked positions to extreme values
+        # Use in-place masked_fill_ instead of indexing assignment
         masked_positions = ~valid_non_masked
-        attn_for_topk[masked_positions] = float('-inf')
-        attn_for_bottomk[masked_positions] = float('inf')
+        attn_for_topk.masked_fill_(masked_positions, float('-inf'))
+        attn_for_bottomk.masked_fill_(masked_positions, float('inf'))
         
         # Use torch.topk on entire matrix at once (much faster than per-row)
         # torch.topk with dim=1 operates on each ROW (each token), extracting top k values
@@ -322,17 +328,31 @@ def compute_attention_with_scores(
         else:
             bottom_sum = torch.tensor(0.0, device=device, dtype=dtype)
             bottom_count = 1
-            
-        del attn_for_topk, attn_for_bottomk, top_values_all, bottom_values_all, top_mask, bottom_mask, top_values_flat, bottom_values_flat
+        
+        # OPTIMIZATION 3: Aggressive memory cleanup
+        # Delete large intermediate tensors immediately after use to reduce peak memory
+        # Group related tensors for clarity
+        
+        # Delete topk/bottomk related tensors
+        del attn_for_topk, attn_for_bottomk
+        del top_values_all, bottom_values_all
+        del top_mask, bottom_mask
+        del top_values_flat, bottom_values_flat
+        
+        # Delete attention and mask tensors
         del valid_attn, valid_non_masked, valid_counts_filtered
-        del valid_indices, num_valid
+        del valid_indices
         del valid_counts, valid_tokens
         del non_masked
+        
+        # Delete input parameters (views, not copies)
         del attn_probs_flat, valid_mask
         del is_packed, cu_seqlens_tensor
-        del device, dtype
-        del num_tokens, kv_len
-        torch.cuda.empty_cache()
+        
+        # Optionally clear CUDA cache if available
+        # Note: This is expensive, only do if memory pressure is high
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return top_sum / top_count, bottom_sum / bottom_count
     
@@ -452,6 +472,10 @@ def compute_attention_with_scores(
                         
                         top_score_means = top_mean.unsqueeze(0)
                         bottom_score_means = bottom_mean.unsqueeze(0)
+                        
+                        # OPTIMIZATION 3: Clean up packed sequence intermediate tensors
+                        del valid_attn, valid_positions_mask, valid_attention_mask
+                        del valid_indices, batch_mask, expanded_mask, packed_mask
                     else:
                         top_score_means = torch.tensor([0.0], device=attn_probs.device, dtype=attn_probs.dtype)
                         bottom_score_means = torch.tensor([0.0], device=attn_probs.device, dtype=attn_probs.dtype)
@@ -459,6 +483,10 @@ def compute_attention_with_scores(
                     # Skip the normal processing below
                     # print("Heartbeat: Before attention output calculation, already finished attention score catch")
                     attn_output = torch.matmul(attn_probs, value_states)
+                    
+                    # OPTIMIZATION 3: Clean up attention computation tensors
+                    del attn_probs, attn_weights
+                    
                     # print("Heartbeat: Already finished attention output calculation")
                     return attn_output, top_score_means, bottom_score_means
         else:
@@ -507,6 +535,9 @@ def compute_attention_with_scores(
         
         top_score_means = torch.stack(top_score_means)
         bottom_score_means = torch.stack(bottom_score_means)
+        
+        # OPTIMIZATION 3: Clean up intermediate tensors after batch processing
+        del expanded_mask, attn_probs_per_batch, attention_mask_per_batch
     
     else:
         # No token mask, but still need to handle causal attention mask
@@ -524,9 +555,17 @@ def compute_attention_with_scores(
         
         top_score_means = torch.stack(top_score_means)
         bottom_score_means = torch.stack(bottom_score_means)
+        
+        # OPTIMIZATION 3: Clean up intermediate tensors
+        del attn_probs_per_batch, attention_mask_per_batch
+    
     # print("Heartbeat: Before reshape, already finished attention score catch")
     # Compute attention output
     attn_output = torch.matmul(attn_probs, value_states)
+    
+    # OPTIMIZATION 3: Clean up attention tensors before returning
+    del attn_probs, attn_weights
+    
     # print("Heartbeat: Already finished attention output calculation")
     return attn_output, top_score_means, bottom_score_means
 
