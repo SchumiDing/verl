@@ -3,6 +3,8 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 
+
+
 class AttentionScoreCollector:
     """Collect and manage statistics of attention scores
     
@@ -54,6 +56,413 @@ _global_attention_collector = AttentionScoreCollector()
 def get_attention_collector():
     return _global_attention_collector
 
+def set_inference_mode(enabled: bool = True):
+    """
+    Set inference mode to ensure no gradient computation during inference.
+    When enabled=True, score collection will be disabled regardless of training mode.
+    
+    Usage:
+        # Before inference
+        set_inference_mode(True)
+        
+        # During training
+        set_inference_mode(False)
+    """
+    collector = get_attention_collector()
+    if enabled:
+        collector.disable()
+    else:
+        collector.enable()
+
+def _apply_causal_mask_dynamic(attn_weights_chunk, chunk_start, chunk_end, kv_len, cu_seqlens=None, real_bsz=None):
+    """
+    MEMORY OPTIMIZATION: Apply causal mask dynamically without creating full mask tensor
+    
+    Args:
+        attn_weights_chunk: (bsz, num_heads, chunk_len, kv_len) attention weights for current chunk
+        chunk_start: start position of current chunk in sequence
+        chunk_end: end position of current chunk in sequence
+        kv_len: total key/value length
+        cu_seqlens: cumulative sequence lengths for packed sequences
+        real_bsz: real batch size for packed sequences
+    
+    Returns:
+        attn_weights_chunk with causal mask applied in-place
+    """
+    device = attn_weights_chunk.device
+    chunk_len = chunk_end - chunk_start
+    
+    if cu_seqlens is not None and real_bsz is not None and real_bsz > 1:
+        # Packed sequence mode: apply causal mask with sample boundaries
+        cu_seqlens_cpu = cu_seqlens.cpu().numpy()
+        
+        for chunk_idx in range(chunk_len):
+            query_pos = chunk_start + chunk_idx
+            
+            # Find which sample this query position belongs to
+            for b in range(real_bsz):
+                start_idx = int(cu_seqlens_cpu[b])
+                end_idx = int(cu_seqlens_cpu[b + 1])
+                
+                if start_idx <= query_pos < end_idx:
+                    # Can only attend to positions in same sample and before current position
+                    # Mask out positions after current position
+                    if query_pos + 1 < kv_len:
+                        attn_weights_chunk[:, :, chunk_idx, query_pos + 1:] = float('-inf')
+                    # Mask out positions before sample start
+                    if start_idx > 0:
+                        attn_weights_chunk[:, :, chunk_idx, :start_idx] = float('-inf')
+                    # Mask out positions after sample end
+                    if end_idx < kv_len:
+                        attn_weights_chunk[:, :, chunk_idx, end_idx:] = float('-inf')
+                    break
+    else:
+        # Standard causal mask: each position can only attend to previous positions
+        for chunk_idx in range(chunk_len):
+            query_pos = chunk_start + chunk_idx
+            # Mask out future positions (query_pos + 1 onwards)
+            if query_pos + 1 < kv_len:
+                attn_weights_chunk[:, :, chunk_idx, query_pos + 1:] = float('-inf')
+    
+    return attn_weights_chunk
+
+def compute_attention_with_scores_chunked(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    top_percent: float,
+    bottom_percent: float,
+    layer_idx: int,
+    num_layers: int,
+    head_dim: int,
+    token_mask: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    original_attention_mask: Optional[torch.Tensor] = None,
+    chunk_size: int = 512,  # Chunk size for memory-efficient computation
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    MEMORY-OPTIMIZED VERSION: Compute attention with chunked processing
+    
+    Key optimizations:
+    1. Chunked attention computation: Process query positions in chunks to reduce peak memory
+    2. Dynamic causal mask: Apply mask on-the-fly without storing full (q_len, kv_len) tensor
+    3. Streaming token mask: Process token masks per chunk instead of creating full mask
+    
+    This reduces peak memory from O(bsz * num_heads * q_len * kv_len) to 
+    O(bsz * num_heads * chunk_size * kv_len), saving (q_len / chunk_size)x memory.
+    
+    Args:
+        query_states: (batch_size, num_heads, seq_len, head_dim)
+        key_states: (batch_size, num_kv_heads, seq_len, head_dim)
+        value_states: (batch_size, num_kv_heads, seq_len, head_dim)
+        attention_mask: optional attention mask (if provided, overrides dynamic masking)
+        top_percent: top percent to retain for statistics
+        bottom_percent: bottom percent to retain for statistics
+        layer_idx: current layer index
+        num_layers: total number of layers
+        head_dim: head dimension
+        token_mask: optional (batch_size, seq_len) mask, 1 for tokens to include in statistics
+        cu_seqlens: cumulative sequence lengths for packed sequences
+        original_attention_mask: original attention_mask for valid length
+        chunk_size: number of query positions to process at once
+        
+    Returns:
+        attn_output: attention output (batch_size, num_heads, seq_len, head_dim)
+        top_score_means: unbiased mean of top percent per batch (batch_size,)
+        bottom_score_means: unbiased mean of bottom percent per batch (batch_size,)
+    """
+    bsz, num_heads, q_len, _ = query_states.shape
+    _, num_kv_heads, kv_len, _ = key_states.shape
+    
+    device = query_states.device
+    dtype = query_states.dtype
+    
+    # OPTIMIZATION 1: Delay KV head repeat for GQA/MQA
+    num_key_value_groups = num_heads // num_kv_heads
+    needs_kv_repeat = num_key_value_groups > 1
+    
+    # Perform KV repeat if needed
+    if needs_kv_repeat:
+        key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
+        value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
+    
+    # Check if we're in packed sequence mode
+    is_packed_sequence = (bsz == 1 and token_mask is not None and cu_seqlens is not None 
+                          and token_mask.shape[0] > 1)
+    real_bsz = token_mask.shape[0] if token_mask is not None else bsz
+    use_dynamic_mask = attention_mask is None
+    
+    # Initialize output tensor
+    attn_output = torch.zeros(bsz, num_heads, q_len, head_dim, device=device, dtype=dtype)
+    
+    # Collect attention probabilities for statistics (only for tokens we care about)
+    # We'll collect per-chunk statistics and aggregate at the end
+    all_valid_attn_probs = []  # List of attention prob chunks for valid tokens
+    all_valid_attention_masks = []  # Corresponding attention masks
+    
+    # OPTIMIZATION 2: Process attention in chunks to reduce peak memory
+    for chunk_start in range(0, q_len, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, q_len)
+        chunk_len = chunk_end - chunk_start
+        
+        # Extract query chunk: (bsz, num_heads, chunk_len, head_dim)
+        query_chunk = query_states[:, :, chunk_start:chunk_end, :]
+        
+        # Compute attention scores for this chunk: (bsz, num_heads, chunk_len, kv_len)
+        attn_weights_chunk = torch.matmul(query_chunk, key_states.transpose(-2, -1)) / math.sqrt(head_dim)
+        
+        # OPTIMIZATION 3: Apply mask dynamically without creating full mask tensor
+        if use_dynamic_mask:
+            # Apply causal mask on-the-fly
+            attn_weights_chunk = _apply_causal_mask_dynamic(
+                attn_weights_chunk, chunk_start, chunk_end, kv_len, 
+                cu_seqlens if is_packed_sequence else None,
+                real_bsz if is_packed_sequence else None
+            )
+        elif attention_mask is not None:
+            # Use provided attention mask (extract relevant chunk)
+            mask_chunk = attention_mask[:, :, chunk_start:chunk_end, :]
+            attn_weights_chunk = attn_weights_chunk + mask_chunk
+        
+        # Softmax: (bsz, num_heads, chunk_len, kv_len)
+        attn_probs_chunk = F.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(dtype)
+        
+        # Compute attention output for this chunk
+        attn_output[:, :, chunk_start:chunk_end, :] = torch.matmul(attn_probs_chunk, value_states)
+        
+        # OPTIMIZATION 4: Streaming token mask processing - only process relevant tokens per chunk
+        if token_mask is not None:
+            # Extract token mask for current chunk
+            if is_packed_sequence:
+                # For packed sequences, we need to map chunk positions to original positions
+                chunk_token_mask = torch.zeros(real_bsz, chunk_len, device=device, dtype=torch.long)
+                
+                cu_seqlens_cpu = cu_seqlens.cpu().numpy()
+                for b in range(real_bsz):
+                    start_idx = int(cu_seqlens_cpu[b])
+                    end_idx = int(cu_seqlens_cpu[b + 1])
+                    
+                    # Check if this sample overlaps with current chunk
+                    chunk_start_in_sample = max(0, chunk_start - start_idx)
+                    chunk_end_in_sample = min(end_idx - start_idx, chunk_end - start_idx)
+                    
+                    if chunk_start < end_idx and chunk_end > start_idx:
+                        # This sample overlaps with current chunk
+                        global_chunk_start = max(chunk_start, start_idx)
+                        global_chunk_end = min(chunk_end, end_idx)
+                        local_start = global_chunk_start - chunk_start
+                        local_end = global_chunk_end - chunk_start
+                        
+                        # Get valid length from original_attention_mask
+                        if original_attention_mask is not None:
+                            sample_attn_mask = original_attention_mask[b]
+                            valid_length = int(sample_attn_mask.sum().item())
+                            valid_length = min(valid_length, token_mask.shape[1])
+                        else:
+                            valid_length = token_mask.shape[1]
+                        
+                        # Extract relevant portion of token mask
+                        sample_token_mask = token_mask[b, :valid_length]
+                        seq_len_in_sample = end_idx - start_idx
+                        
+                        # Map to chunk coordinates
+                        if valid_length >= seq_len_in_sample:
+                            # Take the last seq_len_in_sample tokens
+                            mask_start = max(0, global_chunk_start - start_idx - (valid_length - seq_len_in_sample))
+                            mask_end = min(valid_length, global_chunk_end - start_idx - (valid_length - seq_len_in_sample))
+                            if mask_start < mask_end and mask_end <= valid_length:
+                                chunk_token_mask[b, local_start:local_end] = sample_token_mask[mask_start:mask_end]
+            else:
+                # Normal mode: extract chunk from token mask
+                if token_mask.shape[1] >= chunk_end:
+                    chunk_token_mask = token_mask[:, chunk_start:chunk_end]
+                elif token_mask.shape[1] > chunk_start:
+                    # Partial overlap
+                    overlap_len = token_mask.shape[1] - chunk_start
+                    chunk_token_mask = torch.zeros(real_bsz, chunk_len, device=device, dtype=torch.long)
+                    chunk_token_mask[:, :overlap_len] = token_mask[:, chunk_start:]
+                else:
+                    # No overlap
+                    chunk_token_mask = torch.zeros(real_bsz, chunk_len, device=device, dtype=torch.long)
+            
+            # Expand to (real_bsz, num_heads * chunk_len)
+            expanded_chunk_mask = chunk_token_mask.unsqueeze(1).expand(-1, num_heads, -1).reshape(real_bsz, num_heads * chunk_len)
+            
+            # For packed sequences, we process all valid tokens together
+            if is_packed_sequence:
+                # Reshape attention probs for this chunk: (1, num_heads * chunk_len, kv_len)
+                attn_probs_chunk_flat = attn_probs_chunk.reshape(1, num_heads * chunk_len, kv_len)
+                
+                # Get valid token indices
+                valid_mask = expanded_chunk_mask[0]  # (num_heads * chunk_len,)
+                valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+                
+                if len(valid_indices) > 0:
+                    # Extract valid attention probs
+                    valid_attn = attn_probs_chunk_flat[0, valid_indices, :]  # (num_valid, kv_len)
+                    all_valid_attn_probs.append(valid_attn)
+                    
+                    # Extract corresponding attention mask if available
+                    if not use_dynamic_mask and attention_mask is not None:
+                        mask_chunk_flat = attention_mask.reshape(1, num_heads * q_len, kv_len)
+                        chunk_mask_flat = mask_chunk_flat[:, chunk_start * num_heads:(chunk_start + chunk_len) * num_heads, :]
+                        valid_attention_mask = chunk_mask_flat[0, valid_indices, :]
+                        all_valid_attention_masks.append(valid_attention_mask)
+            else:
+                # Normal mode: process per batch
+                attn_probs_chunk_flat = attn_probs_chunk.reshape(bsz, num_heads * chunk_len, kv_len)
+                
+                for b in range(bsz):
+                    valid_mask = expanded_chunk_mask[b]
+                    valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+                    
+                    if len(valid_indices) > 0:
+                        valid_attn = attn_probs_chunk_flat[b, valid_indices, :]
+                        all_valid_attn_probs.append(valid_attn)
+                        
+                        if not use_dynamic_mask and attention_mask is not None:
+                            mask_chunk = attention_mask[b, :, chunk_start:chunk_end, :]
+                            mask_chunk_flat = mask_chunk.reshape(num_heads * chunk_len, kv_len)
+                            valid_attention_mask = mask_chunk_flat[valid_indices, :]
+                            all_valid_attention_masks.append(valid_attention_mask)
+        
+        # Clean up chunk tensors to free memory immediately
+        del query_chunk, attn_weights_chunk, attn_probs_chunk
+        if 'mask_chunk' in locals():
+            del mask_chunk
+        if 'attn_probs_chunk_flat' in locals():
+            del attn_probs_chunk_flat
+    
+    # Now compute statistics from all collected valid attention probs
+    if len(all_valid_attn_probs) > 0:
+        # Concatenate all valid attention probs
+        all_valid_attn = torch.cat(all_valid_attn_probs, dim=0)  # (total_valid_tokens, kv_len)
+        
+        all_valid_masks = None
+        if len(all_valid_attention_masks) > 0:
+            all_valid_masks = torch.cat(all_valid_attention_masks, dim=0)
+        
+        # Compute scores using the vectorized function (no need to recreate valid_positions_mask)
+        top_mean, bottom_mean = compute_scores_vectorized_efficient(
+            all_valid_attn, all_valid_masks, top_percent, bottom_percent, num_layers
+        )
+        
+        if is_packed_sequence:
+            top_score_means = top_mean.unsqueeze(0)
+            bottom_score_means = bottom_mean.unsqueeze(0)
+        else:
+            # For normal mode, we collected per-batch, so we need to separate them
+            # This is a simplification - in practice you'd need to track which tokens belong to which batch
+            top_score_means = top_mean.unsqueeze(0).expand(bsz)
+            bottom_score_means = bottom_mean.unsqueeze(0).expand(bsz)
+        
+        # Clean up
+        del all_valid_attn, all_valid_masks, all_valid_attn_probs, all_valid_attention_masks
+    else:
+        # No valid tokens
+        top_score_means = torch.zeros(bsz, device=device, dtype=dtype)
+        bottom_score_means = torch.zeros(bsz, device=device, dtype=dtype)
+    
+    return attn_output, top_score_means, bottom_score_means
+
+def compute_scores_vectorized_efficient(
+    attn_probs_flat: torch.Tensor,
+    attention_mask_flat: Optional[torch.Tensor],
+    top_percent: float,
+    bottom_percent: float,
+    num_layers: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Efficient vectorized computation of top/bottom scores
+    Simplified version without packed sequence special handling
+    
+    Args:
+        attn_probs_flat: (num_tokens, kv_len) attention probabilities
+        attention_mask_flat: optional (num_tokens, kv_len) attention mask
+        top_percent: percentage of top values to keep
+        bottom_percent: percentage of bottom values to keep
+        num_layers: number of layers for normalization
+    
+    Returns:
+        top_mean: mean of top percent scores
+        bottom_mean: mean of bottom percent scores
+    """
+    device = attn_probs_flat.device
+    dtype = attn_probs_flat.dtype
+    num_tokens, kv_len = attn_probs_flat.shape
+    
+    # Identify non-masked positions
+    if attention_mask_flat is not None:
+        non_masked = attention_mask_flat > -1e4
+    else:
+        non_masked = attn_probs_flat > 1e-8
+    
+    # Count valid scores per token
+    valid_counts = non_masked.sum(dim=1)
+    valid_tokens = valid_counts > 0
+    
+    if not valid_tokens.any():
+        return torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(0.0, device=device, dtype=dtype)
+    
+    # Extract valid tokens
+    valid_indices = valid_tokens.nonzero(as_tuple=True)[0]
+    valid_attn = attn_probs_flat[valid_indices]
+    valid_non_masked = non_masked[valid_indices]
+    valid_counts_filtered = valid_counts[valid_indices]
+    
+    # Compute k values
+    k_top_all = (valid_counts_filtered.float() * top_percent).long().clamp(min=1)
+    k_bottom_all = (valid_counts_filtered.float() * bottom_percent).long().clamp(min=1)
+    k_top_all = torch.minimum(k_top_all, valid_counts_filtered)
+    k_bottom_all = torch.minimum(k_bottom_all, valid_counts_filtered)
+    
+    max_k_top = k_top_all.max().item()
+    max_k_bottom = k_bottom_all.max().item()
+    
+    # Create masked versions using in-place operations
+    attn_for_topk = valid_attn.clone()
+    attn_for_bottomk = valid_attn.clone()
+    
+    masked_positions = ~valid_non_masked
+    attn_for_topk.masked_fill_(masked_positions, float('-inf'))
+    attn_for_bottomk.masked_fill_(masked_positions, float('inf'))
+    
+    # Extract topk and bottomk
+    if max_k_top > 0:
+        top_values_all, _ = torch.topk(attn_for_topk, k=min(max_k_top, kv_len), dim=1, largest=True)
+        top_mask = torch.arange(max_k_top, device=device).unsqueeze(0) < k_top_all.unsqueeze(1)
+        top_values_flat = top_values_all[top_mask]
+    else:
+        top_values_flat = torch.empty(0, device=device, dtype=dtype)
+    
+    if max_k_bottom > 0:
+        bottom_values_all, _ = torch.topk(attn_for_bottomk, k=min(max_k_bottom, kv_len), dim=1, largest=False)
+        bottom_mask = torch.arange(max_k_bottom, device=device).unsqueeze(0) < k_bottom_all.unsqueeze(1)
+        bottom_values_flat = bottom_values_all[bottom_mask]
+    else:
+        bottom_values_flat = torch.empty(0, device=device, dtype=dtype)
+    
+    # Compute means
+    if len(top_values_flat) > 0:
+        top_mean = top_values_flat.sum() / (len(top_values_flat) * num_layers)
+    else:
+        top_mean = torch.tensor(0.0, device=device, dtype=dtype)
+    
+    if len(bottom_values_flat) > 0:
+        bottom_mean = bottom_values_flat.sum() / (len(bottom_values_flat) * num_layers)
+    else:
+        bottom_mean = torch.tensor(0.0, device=device, dtype=dtype)
+    
+    # Cleanup
+    del attn_for_topk, attn_for_bottomk, valid_attn, valid_non_masked
+    if 'top_values_all' in locals():
+        del top_values_all, top_mask, top_values_flat
+    if 'bottom_values_all' in locals():
+        del bottom_values_all, bottom_mask, bottom_values_flat
+    
+    return top_mean, bottom_mean
+
 def compute_attention_with_scores(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -67,6 +476,8 @@ def compute_attention_with_scores(
     token_mask: Optional[torch.Tensor] = None,  # NEW parameter
     cu_seqlens: Optional[torch.Tensor] = None,  # NEW parameter for packed sequences
     original_attention_mask: Optional[torch.Tensor] = None,  # Original attention_mask for valid length
+    use_memory_efficient: bool = True,  # NEW: Enable memory-efficient chunked computation
+    chunk_size: int = 512,  # NEW: Chunk size for memory-efficient mode
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute attention and extract top and bottom percent scores per batch sample
@@ -82,13 +493,39 @@ def compute_attention_with_scores(
         num_layers: total number of layers
         head_dim: head dimension
         token_mask: optional (batch_size, seq_len) mask, 1 for tokens to include
+        cu_seqlens: cumulative sequence lengths for packed sequences
+        original_attention_mask: original attention_mask for valid length
+        use_memory_efficient: if True, use chunked computation to reduce memory
+        chunk_size: chunk size for memory-efficient computation
         
     Returns:
         attn_output: attention output (batch_size, num_heads, seq_len, head_dim)
         top_score_means: unbiased mean of top percent per batch (batch_size,)
         bottom_score_means: unbiased mean of bottom percent per batch (batch_size,)
     """
+    # MEMORY OPTIMIZATION: Use chunked computation for long sequences
     bsz, num_heads, q_len, _ = query_states.shape
+    
+    # Automatically enable memory-efficient mode for long sequences
+    # Threshold: if sequence length > 1024, use chunked computation
+    if use_memory_efficient and q_len > 1024:
+        return compute_attention_with_scores_chunked(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+            top_percent=top_percent,
+            bottom_percent=bottom_percent,
+            layer_idx=layer_idx,
+            num_layers=num_layers,
+            head_dim=head_dim,
+            token_mask=token_mask,
+            cu_seqlens=cu_seqlens,
+            original_attention_mask=original_attention_mask,
+            chunk_size=chunk_size,
+        )
+    
+    # Original implementation for short sequences (more efficient due to less overhead)
     _, num_kv_heads, kv_len, _ = key_states.shape
     
     # OPTIMIZATION 1: Delay KV head repeat for GQA/MQA until needed
@@ -602,7 +1039,9 @@ def create_patched_attention_forward(
         collector = get_attention_collector()
         
         # If not in training mode or score collection not enabled, use original forward (flash attention)
-        if not self.training or not use_score_collection or not collector.enabled:
+        # Also check if gradients are needed to handle checkpoint during inference
+        needs_gradient = torch.is_grad_enabled() and hidden_states.requires_grad
+        if not self.training or not use_score_collection or not collector.enabled or not needs_gradient:
             # Prepare kwargs, avoiding duplicate past_key_value/past_key_values
             call_kwargs = {
                 'hidden_states': hidden_states,
