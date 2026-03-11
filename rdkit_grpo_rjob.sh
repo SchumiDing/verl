@@ -11,6 +11,7 @@ rjob submit \
     --private-machine=group \
     --mount=gpfs://gpfs1/mineru4s:/mnt/shared-storage-user/mineru4s \
     --mount=gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public \
+    --mount=gpfs://gpfs2/mineru4s-gpfs2:/mnt/shared-storage-gpfs2/mineru4s-gpfs2 \
     --image=registry.h.pjlab.org.cn/ailab-mineru4sh/dingruiyi-vllm-verl-megatron-stable:vllm0.16_verl_with_rdkit \
     --host-network=true \
     -e DISTRIBUTED_JOB=true \

@@ -41,15 +41,15 @@ def validate_smiles(pred_product, org_product):
 
 def create_input_batch(args):
     """Extract input_ids, tokenizer, and product from args tuple."""
-    input_ids, tokenizer, product = args
-    sequence = tokenizer.decode(input_ids, skip_special_tokens=True)
+    response, tokenizer, product = args
+    sequence = tokenizer.decode(response, skip_special_tokens=True)
     # logger.warning(f"sequence: {sequence}")
     # pattern = r"<answer>(.*?)</answer>"
     # matches = re.findall(pattern, sequence)
     # if not matches or ("REACTANT" in matches[-1]):
     #     return False, None
     # match_content = matches[-1]    
-    match_content = product.split("assistant")[-1].strip().replace("\n", "").replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "")
+    match_content = sequence.replace("\n", "").replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "")
     try:
         match_content = Chem.MolToSmiles(Chem.MolFromSmiles(match_content), canonical=True)
     except:
@@ -117,7 +117,7 @@ class ForwardRDKitMinRewardManager(RewardManagerBase):
     async def run_batch_forward(self, data: DataProto) -> DataProto:
         """Async batch forward to avoid blocking the event loop in Ray async actors."""
         await self.vllm_beamsearch_manager.wake_up_async()
-        input_ids = data.batch["input_ids"]
+        responses = data.batch["responses"]
         
         length = len(data)
         # Initialize is_valid for all items (use tensor for TensorDict compatibility)
@@ -132,13 +132,13 @@ class ForwardRDKitMinRewardManager(RewardManagerBase):
             # Do NOT index batch-level numpy arrays with string keys (would cause IndexError)
             reward_model_info = data_item.non_tensor_batch.get("reward_model", {})
             ground_truth = reward_model_info["ground_truth"]
-            args = (input_ids[i], self.tokenizer, ground_truth)
+            args = (responses[i], self.tokenizer, ground_truth)
             result = create_input_batch(args)
             results.append(result)
         
         invalid_items = []
         input_batch = []
-        logger.info(f"results: {results}")
+        # logger.info(f"results: {results}")
         for i, (valid, pyload) in enumerate(results):
             if not valid:
                 invalid_items.append(i)
@@ -168,7 +168,7 @@ class ForwardRDKitMinRewardManager(RewardManagerBase):
             for seq in sequences:
                 # Remove <think>...</think> and extract SMILES
                 # Pattern: <think>\n\n</think>\n\n + SMILES
-                cleaned = re.split("</think>", seq)[-1].replace("<think>", "").replace("</think>", "").replace("\n", "").replace(" ","")
+                cleaned = seq.split("assistant")[-1].replace("<think>", "").replace("</think>", "").replace("\n", "").replace(" ","")
                 cleaned = cleaned.strip()
                 processed_sequences.append(cleaned)
             

@@ -70,13 +70,13 @@ except Exception:
 fi
 
 # 2. 定义模型和数据路径
-ACTOR_MODEL_PATH="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Downstream/output/0305_cot_v1_10e/v0-20260305-225317/checkpoint-0305_cot_v1_10e_10e"
+ACTOR_MODEL_PATH="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Downstream/output/0305_retro_s2s_10e/v0-20260307-193537/checkpoint-0305_retro_s2s_10e_10e"
 FORWARD_MODEL_PATH="/mnt/shared-storage-user/mineru4s/shenxuli/qwen_smiles/output/0305_smiles2smiles_forward/v1-20260306-110334/checkpoint-99090"
-VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k/raw_train_SL_COT_V1_50k_rl.parquet"
-TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k/raw_train_SL_COT_V1_50k_rl.parquet"
+VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl.parquet"
+TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl.parquet"
 
 # 3. 输出目录
-OUTPUT_DIR="/mnt/shared-storage-gpfs2/mineru4s-gpfs2/dingruiyi/wanjuan-0305/checkpoints_rl/forward_rdkit_grpo_min_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="/mnt/shared-storage-gpfs2/mineru4s-gpfs2/dingruiyi/wanjuan-0305/checkpoints_rl/forward_rdkit_grpo_min_s2s_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUTPUT_DIR"
 cp "$0" "$OUTPUT_DIR/"
 
@@ -121,7 +121,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.max_model_len=2048 \
     actor_rollout_ref.rollout.n=8 \
-    actor_rollout_ref.rollout.top_p=0.1 \
+    actor_rollout_ref.rollout.top_p=0.9 \
     actor_rollout_ref.rollout.temperature=0.7 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -140,7 +140,7 @@ python3 -m verl.trainer.main_ppo \
     +reward.beam_search_config.dtype=bfloat16 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "file"]' \
-    trainer.project_name='forward_rdkit_grpo_min' \
+    trainer.project_name='forward_rdkit_grpo_min_s2s' \
     trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_min' \
     trainer.n_gpus_per_node=${NUM_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \

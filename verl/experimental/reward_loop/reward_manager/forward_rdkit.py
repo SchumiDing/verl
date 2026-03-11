@@ -40,15 +40,15 @@ def validate_smiles(pred_product, org_product):
 
 def create_input_batch(args):
     """Extract input_ids, tokenizer, and product from args tuple."""
-    input_ids, tokenizer, product = args
-    sequence = tokenizer.decode(input_ids, skip_special_tokens=True)
+    response, tokenizer, product = args
+    sequence = tokenizer.decode(response, skip_special_tokens=True)
     
     # pattern = r"<answer>(.*?)</answer>"
     # matches = re.findall(pattern, sequence)
     # if not matches or ("REACTANT" in matches[-1]):
     #     return False, None
     # match_content = matches[-1]    
-    match_content = product.split("assistant")[-1].strip().replace("\n", "").replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "")
+    match_content = sequence.split("assistant")[-1].strip().replace("\n", "").replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "")
     try:
         match_content = Chem.MolToSmiles(Chem.MolFromSmiles(match_content), canonical=True)
     except:
@@ -116,7 +116,7 @@ class ForwardRDKitRewardManager(RewardManagerBase):
     async def run_batch_forward(self, data: DataProto) -> DataProto:
         """Async batch forward to avoid blocking the event loop in Ray async actors."""
         await self.vllm_beamsearch_manager.wake_up_async()
-        input_ids = data.batch["input_ids"]
+        responses = data.batch["responses"]
         
         length = len(data)
         # Initialize is_valid for all items (use tensor for TensorDict compatibility)
@@ -125,13 +125,17 @@ class ForwardRDKitRewardManager(RewardManagerBase):
         
         # Process sequentially to avoid Ray + multiprocessing conflicts
         # The original multiprocessing.Pool caused port conflicts with Ray actors
+        # logger.warning(f"First Question: {self.tokenizer.decode(data.batch["prompts"][0], skip_special_tokens=True)}")
+        # logger.warning(f"Last Question: {self.tokenizer.decode(data.batch["prompts"][-1], skip_special_tokens=True)}")
+        # logger.warning(f"First Response: {self.tokenizer.decode(responses[0], skip_special_tokens=True)}")
+        # logger.warning(f"Last Response: {self.tokenizer.decode(responses[-1], skip_special_tokens=True)}")
         results = []
         for i, data_item in enumerate(data):
             # Each data_item.non_tensor_batch["reward_model"]["ground_truth"] is the per-sample ground truth
             # Do NOT index batch-level numpy arrays with string keys (would cause IndexError)
             reward_model_info = data_item.non_tensor_batch.get("reward_model", {})
             ground_truth = reward_model_info["ground_truth"]
-            args = (input_ids[i], self.tokenizer, ground_truth)
+            args = (responses[i], self.tokenizer, ground_truth)
             result = create_input_batch(args)
             results.append(result)
         
@@ -146,7 +150,15 @@ class ForwardRDKitRewardManager(RewardManagerBase):
                 continue
             
             input_batch.append((i, pyload["messages"]))
-        
+        # Log first/last user content to verify inputs differ across samples
+
+        # if input_batch:
+        #     first_content = input_batch[0][1][1].get("content", "")[:80]
+        #     last_content = input_batch[-1][1][1].get("content", "")[:80]
+        #     logger.warning(
+        #         f"input_batch size={len(input_batch)}, first user_content={first_content!r}..., "
+        #         f"last user_content={last_content!r}..."
+        #     )
         # Generate answers using beam search (async to avoid blocking event loop)
         answers = await self.vllm_beamsearch_manager.generate_async(input_batch)
         await self.vllm_beamsearch_manager.sleep_async()
@@ -166,7 +178,7 @@ class ForwardRDKitRewardManager(RewardManagerBase):
             for seq in sequences:
                 # Remove <think>...</think> and extract SMILES
                 # Pattern: <think>\n\n</think>\n\n + SMILES
-                cleaned = seq.split("</think>")[-1].replace("<think>", "").replace("</think>", "").replace("\n", "").replace(" ","")
+                cleaned = seq.split("assistant")[-1].replace("<think>", "").replace("</think>", "").replace("\n", "").replace(" ","")
                 cleaned = cleaned.strip()
                 processed_sequences.append(cleaned)
             
