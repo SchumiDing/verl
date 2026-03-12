@@ -76,7 +76,7 @@ VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl
 TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl.parquet"
 
 # 3. 输出目录
-OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0305/checkpoints_rl/forward_rdkit_grpo_min_s2s_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0305/checkpoints_rl/forward_rdkit_grpo_s2s_top1_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUTPUT_DIR"
 cp "$0" "$OUTPUT_DIR/"
 
@@ -89,7 +89,6 @@ TOTAL_EPOCHS=10
 
 export TIKTOKEN_ENCODINGS_BASE=/root/encoder
 export TIKTOKEN_RS_CACHE_DIR=/root/encoder
-export VLLM_ATTENTION_BACKEND=FLASHINFER
 
 cd /mnt/shared-storage-user/mineru4s/dingruiyi/WanjuanTraining
 export VERL_FILE_LOGGER_PATH="($OUTPUT_DIR/log.jsonl)"
@@ -127,21 +126,21 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     algorithm.use_kl_in_reward=False \
-    reward.reward_manager.name=forward_rdkit_min \
+    reward.reward_manager.name=forward_rdkit \
     reward.reward_manager.source=register \
     reward.num_workers=8 \
     reward.reward_model.enable=False \
     +reward.forward_model.model_path="$FORWARD_MODEL_PATH" \
     +reward.forward_model.num_gpus=2 \
-    +reward.beam_search_config.beam_width=3 \
-    +reward.beam_search_config.max_tokens=512 \
+    +reward.beam_search_config.beam_width=1 \
+    +reward.beam_search_config.max_tokens=512\
     +reward.beam_search_config.max_model_len=3176 \
     +reward.beam_search_config.gpu_memory_utilization=0.3 \
     +reward.beam_search_config.dtype=bfloat16 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "file"]' \
-    trainer.project_name='forward_rdkit_grpo_min_s2s' \
-    trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_min' \
+    trainer.project_name='forward_rdkit_grpo_top1' \
+    trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_top1' \
     trainer.n_gpus_per_node=${NUM_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
     trainer.save_freq=39 \

@@ -76,7 +76,7 @@ VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl
 TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl.parquet"
 
 # 3. 输出目录
-OUTPUT_DIR="/mnt/shared-storage-gpfs2/mineru4s-gpfs2/dingruiyi/wanjuan-0305/checkpoints_rl/forward_rdkit_grpo_s2s_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0305/checkpoints_rl/forward_rdkit_grpo_s2s_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUTPUT_DIR"
 cp "$0" "$OUTPUT_DIR/"
 
