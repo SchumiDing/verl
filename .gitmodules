@@ -1,3 +1,6 @@
 [submodule "recipe"]
 	path = recipe
 	url = https://github.com/verl-project/verl-recipe.git
+[submodule "Flash_Attn_with_Score_bp_support"]
+	path = Flash_Attn_with_Score_bp_support
+	url = https://github.com/SchumiDing/Flash_Attn_with_Score_bp_support
