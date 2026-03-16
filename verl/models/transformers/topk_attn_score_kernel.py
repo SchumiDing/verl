@@ -11,7 +11,7 @@ Backward: scatter grad_topk_sum and grad_bottom_sum to the positions that were s
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
@@ -35,7 +35,7 @@ def _merge_sorted_chunks_and_sum(
     k_top: torch.Tensor,
     k_bottom: torch.Tensor,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     K-way merge of already-sorted chunks: same result as concat + full sort.
     top_batch: (batch_tokens, num_chunks, K) sorted descending per chunk
@@ -388,9 +388,7 @@ def _topk_bottomk_sum_forward_chunked(
         k_bottom = torch.minimum(k_bottom, total_valid)
 
         # K-way merge of sorted chunks (same result as concat + full sort)
-        top_sum_batch, bottom_sum_batch = _merge_sorted_chunks_and_sum(
-            top_batch, bottom_batch, k_top, k_bottom, device
-        )
+        top_sum_batch, bottom_sum_batch = _merge_sorted_chunks_and_sum(top_batch, bottom_batch, k_top, k_bottom, device)
         topk_sum_acc = topk_sum_acc + top_sum_batch
         bottomk_sum_acc = bottomk_sum_acc + bottom_sum_batch
 
