@@ -377,6 +377,12 @@ class AgentLoopWorker:
 
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
+        
+        # Check if reward manager is distill type (needs rollout-level batching)
+        self.is_distill_reward_manager = False
+        if hasattr(config, 'reward') and hasattr(config.reward, 'reward_manager'):
+            reward_manager_name = config.reward.reward_manager.get('name', '')
+            self.is_distill_reward_manager = 'distill' in reward_manager_name.lower()
 
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path
         if agent_loop_config_path:
@@ -474,6 +480,10 @@ class AgentLoopWorker:
                 )
             )
         outputs = await asyncio.gather(*tasks)
+
+        # For distill managers, compute rewards in batch by rollout groups
+        if self.is_distill_reward_manager and self.reward_loop_worker_handles is not None:
+            await self._compute_batch_rewards(outputs, batch.non_tensor_batch)
 
         output = self._postprocess(outputs, input_non_tensor_batch=batch.non_tensor_batch)
 
@@ -693,9 +703,103 @@ class AgentLoopWorker:
         position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
         return position_ids
 
+    async def _compute_batch_rewards(self, outputs: list, input_non_tensor_batch: dict):
+        """Compute rewards in batch for distill managers (by rollout groups)."""
+        rollout_n = self.rollout_config.n
+        num_samples = len(outputs)
+        
+        # Group outputs by rollout (assuming they are already ordered)
+        tasks = []
+        for i in range(0, num_samples, rollout_n):
+            rollout_group = outputs[i:i + rollout_n]
+            
+            # Build batch data for this rollout group
+            batch_list = []
+            non_tensor_batch_list = []
+            for j, output in enumerate(rollout_group):
+                batch = TensorDict(
+                    {
+                        "prompts": output.prompt_ids,
+                        "responses": output.response_ids,
+                        "attention_mask": output.attention_mask,
+                        "input_ids": output.input_ids,
+                        "position_ids": output.position_ids,
+                    },
+                    batch_size=1,
+                )
+                batch_list.append(batch)
+                
+                # Extract kwargs for this sample
+                kwargs = {k: v[i + j] for k, v in input_non_tensor_batch.items()}
+                non_tensor_batch = {
+                    **{k: np.array([v]) for k, v in kwargs.items()},
+                    "__num_turns__": np.array([output.num_turns]),
+                    "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                }
+                non_tensor_batch_list.append(non_tensor_batch)
+            
+            # Concatenate all batches in the rollout group
+            combined_batch = TensorDict.cat(batch_list, dim=0)
+            combined_non_tensor_batch = {
+                k: np.concatenate([ntb[k] for ntb in non_tensor_batch_list])
+                for k in non_tensor_batch_list[0].keys()
+            }
+            
+            data = DataProto(
+                batch=combined_batch,
+                non_tensor_batch=combined_non_tensor_batch,
+            )
+            
+            # Send to reward worker (compute_score handles rollout groups for distill managers)
+            selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
+            tasks.append(selected_reward_loop_worker_handle.compute_score.remote(data))
+        
+        # Gather all results using asyncio-compatible approach
+        # Convert Ray ObjectRefs to asyncio futures
+        async def get_result(task):
+            return await asyncio.to_thread(ray.get, task)
+        
+        results = await asyncio.gather(*[get_result(task) for task in tasks])
+        
+        # Distribute results back to outputs
+        result_idx = 0
+        for result in results:
+            # Result contains reward_score (list) and reward_extra_info for the rollout group
+            reward_scores = result.get("reward_score")
+            reward_extra_info = result.get("reward_extra_info", {})
+            
+            if isinstance(reward_scores, list):
+                # Distill manager returns list of scores
+                for idx, score in enumerate(reward_scores):
+                    outputs[result_idx].reward_score = score
+                    # Extract per-item extra info
+                    outputs[result_idx].extra_fields["reward_extra_info"] = {}
+                    for key, value in reward_extra_info.items():
+                        if isinstance(value, list):
+                            if len(value) == len(reward_scores):
+                                # Per-item value: extract the corresponding item
+                                outputs[result_idx].extra_fields["reward_extra_info"][key] = value[idx]
+                            else:
+                                # Shared list (e.g., finded): each sample gets a copy to ensure consistent structure
+                                # Store as tuple to make it immutable and hashable
+                                outputs[result_idx].extra_fields["reward_extra_info"][key] = tuple(value)
+                        else:
+                            # Scalar value: replicate for all samples
+                            outputs[result_idx].extra_fields["reward_extra_info"][key] = value
+                    result_idx += 1
+            else:
+                # Single score (shouldn't happen for distill, but handle it)
+                outputs[result_idx].reward_score = reward_scores
+                outputs[result_idx].extra_fields["reward_extra_info"] = reward_extra_info
+                result_idx += 1
+
     async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
         """Compute reward score for single sample."""
         enable_async_reward = self.reward_loop_worker_handles is not None
+
+        # For distill managers, skip individual scoring (will be done in batch in _postprocess)
+        if self.is_distill_reward_manager:
+            return
 
         if output.reward_score is None and enable_async_reward:
             batch = TensorDict(
@@ -772,9 +876,19 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = list(reward_extra_infos[0].keys()) if reward_extra_infos and reward_extra_infos[0] else []
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            values = [info[key] for info in reward_extra_infos]
+            # Check if all values are scalars (int, float, bool)
+            all_scalars = all(isinstance(v, (int, float, bool, np.number)) for v in values)
+            
+            if all_scalars:
+                # For scalar values, create regular array
+                non_tensor_batch[key] = np.array(values)
+            else:
+                # For non-scalar values (lists, etc.), always use object dtype
+                # This ensures consistent dimensionality across workers
+                non_tensor_batch[key] = np.array(values, dtype=object)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

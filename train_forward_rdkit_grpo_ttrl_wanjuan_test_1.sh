@@ -22,7 +22,7 @@ RAY_WAIT_TIMEOUT_SEC=${RAY_WAIT_TIMEOUT_SEC:-120}
 
 # 【重要】输出目录与 VERL_FILE_LOGGER_PATH 必须在 ray start 之前 export，否则 Ray worker 进程
 # 继承的是此时的环境；Tracker/FileLogger 在 Ray TaskRunner（actor）里创建，读的是 worker 的 env。
-OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0314/checkpoints_rl/forward_rdkit_grpo_cot_v1_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0314/checkpoints_rl/forward_rdkit_grpo_cot_v1_ttrl_wanjuan_test_1_$(date +%Y%m%d_%H%M)"
 mkdir -p "$OUTPUT_DIR"
 cp "$0" "$OUTPUT_DIR/"
 export VERL_FILE_LOGGER_PATH="$OUTPUT_DIR/log.jsonl"
@@ -79,10 +79,10 @@ except Exception:
 fi
 
 # 2. 定义模型和数据路径
-ACTOR_MODEL_PATH="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Downstream/output/0314_cot_v1_10e_50k/v0-20260316-155326/checkpoint-0314_cot_v1_10e_50k_1e"
-FORWARD_MODEL_PATH="/mnt/shared-storage-user/mineru4s/shenxuli/qwen_smiles/output/0314_finetune_smiles2smiles_forward/v3-20260316-140309/checkpoint-157"
-VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-V1/raw_train_rl.parquet"
-TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-V1/raw_train_rl.parquet"
+ACTOR_MODEL_PATH="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Downstream/output/0314_cot_v1_10e/v0-20260314-102354/checkpoint-0314_cot_v1_10e_8e"
+FORWARD_MODEL_PATH="/mnt/shared-storage-user/mineru4s/shenxuli/qwen_smiles/output/0314_smiles2smiles_forward/v0-20260314-100637/checkpoint-105950"
+VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Test_0314_V1/all_rl_test_1.parquet"
+TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Test_0314_V1/all_rl_test_1.parquet"
 
 # 3. 训练参数（OUTPUT_DIR/VERL_FILE_LOGGER_PATH/cd 已移至 ray start 前）
 NUM_GPUS_PER_NODE=8
@@ -141,11 +141,11 @@ python3 -m verl.trainer.main_ppo \
     +reward.beam_search_config.dtype=bfloat16 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "file"]' \
-    trainer.project_name='forward_rdkit_grpo_cot_v1' \
-    trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_cot_v1' \
+    trainer.project_name='forward_rdkit_grpo_cot_v1_ttrl_wanjuan_test_1' \
+    trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_cot_v1_ttrl_wanjuan_test_1' \
     trainer.n_gpus_per_node=${NUM_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.save_freq=39 \
+    trainer.save_freq=10 \
     trainer.test_freq=-1 \
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.resume_mode=disable \

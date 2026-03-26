@@ -43,12 +43,12 @@ def create_input_batch(args):
     response, tokenizer, product = args
     sequence = tokenizer.decode(response, skip_special_tokens=True)
     
-    # pattern = r"<answer>(.*?)</answer>"
-    # matches = re.findall(pattern, sequence)
-    # if not matches or ("REACTANT" in matches[-1]):
-    #     return False, None
-    # match_content = matches[-1]    
-    match_content = sequence.split("assistant")[-1].strip().replace("\n", "").replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "")
+    pattern = r"<answer>(.*?)</answer>"
+    matches = re.findall(pattern, sequence)
+    if not matches or ("REACTANT" in matches[-1]):
+        return False, None
+    match_content = matches[-1]    
+    # match_content = sequence.split("assistant")[-1].strip().replace("\n", "").replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "")
     try:
         match_content = Chem.MolToSmiles(Chem.MolFromSmiles(match_content), canonical=True)
     except:
@@ -73,8 +73,8 @@ def create_input_batch(args):
 
 
 
-@register("forward_rdkit")
-class ForwardRDKitRewardManager(RewardManagerBase):
+@register("forward_rdkit_cot")
+class ForwardRDKitCOTRewardManager(RewardManagerBase):
     """The reward manager."""
 
     def __init__(

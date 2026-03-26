@@ -22,7 +22,7 @@ RAY_WAIT_TIMEOUT_SEC=${RAY_WAIT_TIMEOUT_SEC:-120}
 
 # 【重要】输出目录与 VERL_FILE_LOGGER_PATH 必须在 ray start 之前 export，否则 Ray worker 进程
 # 继承的是此时的环境；Tracker/FileLogger 在 Ray TaskRunner（actor）里创建，读的是 worker 的 env。
-OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0314/checkpoints_rl/forward_rdkit_grpo_cot_v1_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0314/checkpoints_rl/rdkit_grpo_cot_v1_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUTPUT_DIR"
 cp "$0" "$OUTPUT_DIR/"
 export VERL_FILE_LOGGER_PATH="$OUTPUT_DIR/log.jsonl"
@@ -80,9 +80,8 @@ fi
 
 # 2. 定义模型和数据路径
 ACTOR_MODEL_PATH="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Downstream/output/0314_cot_v1_10e_50k/v0-20260316-155326/checkpoint-0314_cot_v1_10e_50k_1e"
-FORWARD_MODEL_PATH="/mnt/shared-storage-user/mineru4s/shenxuli/qwen_smiles/output/0314_finetune_smiles2smiles_forward/v3-20260316-140309/checkpoint-157"
-VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-V1/raw_train_rl.parquet"
-TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-V1/raw_train_rl.parquet"
+VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-V1/raw_train_rl_match.parquet"
+TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-V1/raw_train_rl_match.parquet"
 
 # 3. 训练参数（OUTPUT_DIR/VERL_FILE_LOGGER_PATH/cd 已移至 ray start 前）
 NUM_GPUS_PER_NODE=8
@@ -128,21 +127,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     algorithm.use_kl_in_reward=False \
-    reward.reward_manager.name=forward_rdkit_cot \
+    reward.reward_manager.name=rdkit \
     reward.reward_manager.source=register \
     reward.num_workers=8 \
     reward.reward_model.enable=False \
-    +reward.forward_model.model_path="$FORWARD_MODEL_PATH" \
-    +reward.forward_model.num_gpus=2 \
-    +reward.beam_search_config.beam_width=3 \
-    +reward.beam_search_config.max_tokens=512\
-    +reward.beam_search_config.max_model_len=3176 \
-    +reward.beam_search_config.gpu_memory_utilization=0.3 \
-    +reward.beam_search_config.dtype=bfloat16 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "file"]' \
-    trainer.project_name='forward_rdkit_grpo_cot_v1' \
-    trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_cot_v1' \
+    trainer.project_name='rdkit_grpo_cot_v1' \
+    trainer.experiment_name='qwen3.5_4b_rdkit_grpo_cot_v1' \
     trainer.n_gpus_per_node=${NUM_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
     trainer.save_freq=39 \

@@ -19,6 +19,15 @@ RAY_MIN_GPUS=${RAY_MIN_GPUS:-}
 RAY_WAIT_TIMEOUT_SEC=${RAY_WAIT_TIMEOUT_SEC:-120}
 # 若集群提供 NODE_COUNT，可自动设置等待 GPU 数（未设置 NUM_GPUS_PER_NODE 时按每节点 8 卡算）
 [[ -z "$RAY_MIN_GPUS" && -n "${NODE_COUNT:-}" ]] && RAY_MIN_GPUS=$((NODE_COUNT * ${NUM_GPUS_PER_NODE:-8}))
+
+# 【重要】输出目录与 VERL_FILE_LOGGER_PATH 必须在 ray start 之前 export，否则 Ray worker 进程
+# 继承的是此时的环境；Tracker/FileLogger 在 Ray TaskRunner（actor）里创建，读的是 worker 的 env。
+OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0314/checkpoints_rl/forward_rdkit_grpo_cot_v1_ttrl_wanjuan_test_$(date +%Y%m%d_%H%M)"
+mkdir -p "$OUTPUT_DIR"
+cp "$0" "$OUTPUT_DIR/"
+export VERL_FILE_LOGGER_PATH="$OUTPUT_DIR/log.jsonl"
+cd /mnt/shared-storage-user/mineru4s/dingruiyi/WanjuanTraining
+
 get_self_ip() {
   [[ -n "$HEAD_IP" ]] && { echo "$HEAD_IP"; return; }
   [[ -n "$POD_IP" ]] && { echo "$POD_IP"; return; }
@@ -70,17 +79,12 @@ except Exception:
 fi
 
 # 2. 定义模型和数据路径
-ACTOR_MODEL_PATH="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Downstream/output/0305_retro_s2s_10e/v0-20260307-193537/checkpoint-0305_retro_s2s_10e_10e"
-FORWARD_MODEL_PATH="/mnt/shared-storage-user/mineru4s/shenxuli/qwen_smiles/output/0305_smiles2smiles_forward/v1-20260306-110334/checkpoint-99090"
-VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl.parquet"
-TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/USPTO-50k-s2s/raw_train_rl.parquet"
+ACTOR_MODEL_PATH="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Downstream/output/0314_cot_v1_10e/v0-20260314-102354/checkpoint-0314_cot_v1_10e_8e"
+FORWARD_MODEL_PATH="/mnt/shared-storage-user/mineru4s/shenxuli/qwen_smiles/output/0314_smiles2smiles_forward/v0-20260314-100637/checkpoint-105950"
+VAL_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Test_0314_V1/all_rl.parquet"
+TRAIN_DATA="/mnt/shared-storage-user/mineru4s/dingruiyi/WanJRxn_Test_0314_V1/all_rl.parquet"
 
-# 3. 输出目录
-OUTPUT_DIR="/mnt/shared-storage-user/mineru4s/dingruiyi/wanjuan-0305/checkpoints_rl/forward_rdkit_grpo_min_s2s_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$OUTPUT_DIR"
-cp "$0" "$OUTPUT_DIR/"
-
-# 4. 训练参数
+# 3. 训练参数（OUTPUT_DIR/VERL_FILE_LOGGER_PATH/cd 已移至 ray start 前）
 NUM_GPUS_PER_NODE=8
 NNODES=2
 TRAIN_BATCH_SIZE=1024
@@ -89,10 +93,7 @@ TOTAL_EPOCHS=10
 
 export TIKTOKEN_ENCODINGS_BASE=/root/encoder
 export TIKTOKEN_RS_CACHE_DIR=/root/encoder
-export VLLM_ATTENTION_BACKEND=FLASHINFER
 
-cd /mnt/shared-storage-user/mineru4s/dingruiyi/WanjuanTraining
-export VERL_FILE_LOGGER_PATH="($OUTPUT_DIR/log.jsonl)"
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$TRAIN_DATA" \
@@ -127,24 +128,24 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     algorithm.use_kl_in_reward=False \
-    reward.reward_manager.name=forward_rdkit_min \
+    reward.reward_manager.name=forward_rdkit_cot \
     reward.reward_manager.source=register \
     reward.num_workers=8 \
     reward.reward_model.enable=False \
     +reward.forward_model.model_path="$FORWARD_MODEL_PATH" \
     +reward.forward_model.num_gpus=2 \
     +reward.beam_search_config.beam_width=3 \
-    +reward.beam_search_config.max_tokens=512 \
+    +reward.beam_search_config.max_tokens=512\
     +reward.beam_search_config.max_model_len=3176 \
     +reward.beam_search_config.gpu_memory_utilization=0.3 \
     +reward.beam_search_config.dtype=bfloat16 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "file"]' \
-    trainer.project_name='forward_rdkit_grpo_min_s2s' \
-    trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_min' \
+    trainer.project_name='forward_rdkit_grpo_cot_v1_ttrl_wanjuan_test' \
+    trainer.experiment_name='qwen3.5_4b_forward_rdkit_grpo_cot_v1_ttrl_wanjuan_test' \
     trainer.n_gpus_per_node=${NUM_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.save_freq=39 \
+    trainer.save_freq=10 \
     trainer.test_freq=-1 \
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.resume_mode=disable \

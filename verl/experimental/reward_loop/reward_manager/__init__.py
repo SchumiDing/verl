@@ -19,14 +19,22 @@ from .limited import RateLimitedRewardManager
 from .remote import RemoteRewardManager
 from .forward_rdkit import ForwardRDKitRewardManager
 from .forward_rdkit_min import ForwardRDKitMinRewardManager
+from .forward_rdkit_cot import ForwardRDKitCOTRewardManager
+from .multiroute_distill_cot import MultirouteDistillCoTRewardManager
+from .multiroute_nonedistill_cot import MultirouteNonedistillCoverRateCoTRewardManager
+from .rdkit import RDKitRewardManager
 
 __all__ = [
     "ForwardRDKitRewardManager",
     "ForwardRDKitMinRewardManager",
+    "ForwardRDKitCOTRewardManager",
+    "MultirouteDistillCoTRewardManager",
+    "MultirouteNonedistillCoverRateCoTRewardManager",
     "DAPORewardManager",
     "NaiveRewardManager",
     "RateLimitedRewardManager",
     "RemoteRewardManager",
+    "RDKitRewardManager",
     "register",
     "get_reward_manager_cls",
 ]

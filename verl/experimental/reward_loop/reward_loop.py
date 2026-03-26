@@ -181,29 +181,140 @@ class RewardLoopWorker:
             print(f"[RewardLoopWorker] run_batch_forward NOT FOUND - skipping batch forward")
             print(f"[RewardLoopWorker] Available methods: {[m for m in dir(self.reward_manager) if not m.startswith('_')]}")
         
-        tasks = []
-        # asyncio application
-        for i in range(len(data)):
-            # Use direct indexing instead of slicing to preserve all keys
-            single_data = data[i : i + 1]
-            logger.debug(f"Item {i} batch keys before compute_score: {list(single_data.batch.keys())}")
-            tasks.append(asyncio.create_task(self.compute_score(single_data)))
-        outputs = await asyncio.gather(*tasks)
+        # Check if reward_manager name contains "distill" to determine processing strategy
+        reward_manager_name = self.config.reward.reward_manager.name
+        is_distill_manager = "distill" in reward_manager_name.lower()
         
-        return outputs
+        if is_distill_manager:
+            # For distill managers: process by rollout groups
+            rollout_n = self.config.actor_rollout_ref.rollout.n
+            print(f"[RewardLoopWorker] Distill manager detected, processing by rollout groups (n={rollout_n})")
+            
+            tasks = []
+            for i in range(0, len(data), rollout_n):
+                # Extract a full rollout group
+                rollout_data = data[i : i + rollout_n]
+                logger.debug(f"Rollout group {i//rollout_n} batch keys: {list(rollout_data.batch.keys())}")
+                tasks.append(asyncio.create_task(self.compute_score(rollout_data)))
+            outputs = await asyncio.gather(*tasks)
+            
+            # Flatten outputs: each output contains multiple reward_scores for the rollout group
+            outputs_flat = []
+            for output in outputs:
+                reward_scores = output.get("reward_score")
+                if isinstance(reward_scores, list):
+                    # Multiple scores in one output, expand them
+                    for idx, score in enumerate(reward_scores):
+                        single_output = {"reward_score": score}
+                        if "reward_extra_info" in output:
+                            # Extract per-item extra info if available
+                            single_output["reward_extra_info"] = {}
+                            for key, value in output["reward_extra_info"].items():
+                                if isinstance(value, list) and len(value) == len(reward_scores):
+                                    single_output["reward_extra_info"][key] = value[idx]
+                                else:
+                                    # For non-list values, replicate for all items in the rollout
+                                    single_output["reward_extra_info"][key] = value
+                        
+                        # Special handling for drop_mask - ensure it's extracted as a list item
+                        # Check both direct output and reward_extra_info for drop_mask
+                        drop_mask = None
+                        if "drop_mask" in output:
+                            drop_mask = output["drop_mask"]
+                        elif "reward_extra_info" in output and "drop_mask" in output["reward_extra_info"]:
+                            drop_mask = output["reward_extra_info"]["drop_mask"]
+                        
+                        if drop_mask is not None:
+                            if isinstance(drop_mask, list) and len(drop_mask) == len(reward_scores):
+                                single_output["drop_mask"] = drop_mask[idx]
+                            else:
+                                # If drop_mask is not a list or length mismatch, use the whole mask
+                                single_output["drop_mask"] = drop_mask
+                        
+                        outputs_flat.append(single_output)
+                else:
+                    # Single score, just append as is
+                    # Also handle drop_mask for single score case
+                    drop_mask = None
+                    if "drop_mask" in output:
+                        drop_mask = output["drop_mask"]
+                    elif "reward_extra_info" in output and "drop_mask" in output["reward_extra_info"]:
+                        drop_mask = output["reward_extra_info"]["drop_mask"]
+                    
+                    if drop_mask is not None:
+                        single_output = {"reward_score": reward_scores, "drop_mask": drop_mask}
+                        if "reward_extra_info" in output:
+                            single_output["reward_extra_info"] = output["reward_extra_info"]
+                        outputs_flat.append(single_output)
+                    else:
+                        outputs_flat.append(output)
+            
+            return outputs_flat
+        else:
+            # For non-distill managers: process each item individually
+            print(f"[RewardLoopWorker] Non-distill manager, processing items individually")
+            tasks = []
+            for i in range(len(data)):
+                # Use direct indexing instead of slicing to preserve all keys
+                single_data = data[i : i + 1]
+                logger.debug(f"Item {i} batch keys before compute_score: {list(single_data.batch.keys())}")
+                tasks.append(asyncio.create_task(self.compute_score(single_data)))
+            outputs = await asyncio.gather(*tasks)
+            
+            return outputs
 
     async def compute_score(self, data: DataProto) -> dict:
-        assert len(data) == 1, "RewardLoopWorker only support single data item"
-        if self.config.reward.custom_reward_function.path is not None:
-            # directly use user-customized reward function
-            return await self.reward_manager.run_single(data)
-        else:
-            if self.config.reward.reward_model.enable:
-                # we assume the rm is disrm
-                # genrm must set custom_reward_function
-                return await self.compute_score_disrm(data)
-            else:
+        # Check if this is a distill manager
+        reward_manager_name = self.config.reward.reward_manager.name
+        is_distill_manager = "distill" in reward_manager_name.lower()
+        
+        if is_distill_manager:
+            # For distill managers: expect a full rollout group
+            rollout_n = self.config.actor_rollout_ref.rollout.n
+            assert len(data) == rollout_n, f"Distill manager expects rollout group of size {rollout_n}, got {len(data)}"
+            
+            # Process the entire rollout group
+            if self.config.reward.custom_reward_function.path is not None:
                 return await self.reward_manager.run_single(data)
+            else:
+                if self.config.reward.reward_model.enable:
+                    # For disrm with distill: score each item but return as list
+                    scores = []
+                    for i in range(len(data)):
+                        single_data = data[i : i + 1]
+                        result = await self.compute_score_disrm(single_data)
+                        scores.append(result["reward_score"])
+                    return {"reward_score": scores}
+                else:
+                    result = await self.reward_manager.run_single(data)
+                    # Ensure drop_mask is included in the result if available
+                    if isinstance(result, dict) and "drop_mask" in result:
+                        # Return the complete result including drop_mask
+                        return result
+                    else:
+                        # Fallback for backward compatibility
+                        return result
+        else:
+            # For non-distill managers: expect single item
+            assert len(data) == 1, "Non-distill manager expects single data item"
+            
+            if self.config.reward.custom_reward_function.path is not None:
+                result = await self.reward_manager.run_single(data)
+                # Ensure drop_mask is included in the result if available
+                if isinstance(result, dict) and "drop_mask" in result:
+                    return result
+                else:
+                    return result
+            else:
+                if self.config.reward.reward_model.enable:
+                    return await self.compute_score_disrm(data)
+                else:
+                    result = await self.reward_manager.run_single(data)
+                    # Ensure drop_mask is included in the result if available
+                    if isinstance(result, dict) and "drop_mask" in result:
+                        return result
+                    else:
+                        return result
 
     async def _post_request(self, payload: dict, endpoint: str, max_retries: int = 16):
         url = f"http://{self.reward_router_address}/{endpoint}"
